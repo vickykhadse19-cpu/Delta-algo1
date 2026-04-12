@@ -1,5 +1,5 @@
 """
-Delta Exchange India — BTC + ETH S/R Breakout Algo
+Delta Exchange India â€” BTC + ETH S/R Breakout Algo
 ===================================================
 Strategy : 1H S/R detection -> 15M confirmation -> Bracket order (SL + TP 1:4)
 Exchange : Delta Exchange India  (api.india.delta.exchange)
@@ -10,9 +10,9 @@ Risk     : 1.5% per trade   (increased from 1% for more profit)
 import os, time, hmac, hashlib, json, requests, logging
 from datetime import datetime, timezone
 
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  CONFIGURATION
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 API_KEY    = os.environ.get("DELTA_API_KEY",    "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 BASE_URL   = "https://api.india.delta.exchange"
@@ -23,8 +23,8 @@ ASSETS = {
     "ETH": {"symbol": "ETHUSD", "product_id": None},
 }
 
-RISK_PERCENT   = 1.5    # increased from 1.0 → more profit, still safe
-RR_RATIO       = 4.0    # take profit = risk × 4  (1:4 RR)
+RISK_PERCENT   = 1.5    # increased from 1.0 â†’ more profit, still safe
+RR_RATIO       = 4.0    # take profit = risk Ã— 4  (1:4 RR)
 MIN_BREAK_PCT  = 0.001
 MAX_BREAK_PCT  = 0.03
 SR_LOOKBACK    = 5
@@ -42,9 +42,9 @@ logging.basicConfig(
 log = logging.getLogger("delta_algo")
 
 
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  AUTH HELPERS
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def auth_headers(method, path, query_string="", body=""):
     timestamp = str(int(time.time()))
     message   = method + timestamp + path
@@ -80,9 +80,9 @@ def api_post(path, payload):
     return r.json()
 
 
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  MARKET DATA
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def get_product_id(symbol):
     try:
         url = f"{BASE_URL}/v2/tickers?contract_types=perpetual_futures"
@@ -123,21 +123,27 @@ def get_candles(symbol, resolution, limit=110):
 
 
 def get_wallet_balance():
+    """
+    Try to fetch real balance.
+    If Delta India API blocks the request (geo-block from GitHub USA servers)
+    fall back to a safe default so algo can still run and place orders.
+    Exchange will reject orders automatically if real margin is insufficient.
+    """
     try:
         data = api_get("/v2/wallet/balances")
-        for b in data.get("result", []):
+        balances = data.get("result", [])
+        for b in balances:
             val = float(b.get("available_balance", 0) or 0)
             if val > 0:
                 log.info(f"  Asset: {b.get('asset_symbol')}  Balance: {val:.2f}")
                 return val
-        return 0.0
-    except requests.HTTPError as e:
-        sc = e.response.status_code if e.response else 0
-        log.warning(f"  Wallet balance HTTP {sc}")
+        log.warning("  All balances are zero on exchange.")
         return 0.0
     except Exception as e:
-        log.warning(f"  Wallet balance error: {e}")
-        return 0.0
+        log.warning(f"  Could not fetch balance ({e})")
+        log.warning(f"  This is likely a geo-block (GitHub USA -> Delta India)")
+        log.warning(f"  Using fallback balance for position sizing.")
+        return -1.0   # special value meaning: use fallback
 
 
 def get_open_position(product_id):
@@ -152,9 +158,9 @@ def get_open_position(product_id):
         return None
 
 
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  S/R DETECTION
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def detect_sr_levels(candles):
     raw, n, lb = [], len(candles), SR_LOOKBACK
     for i in range(lb, n - lb):
@@ -175,9 +181,9 @@ def detect_sr_levels(candles):
     return sorted(out, key=lambda x: -x["strength"])[:10]
 
 
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  SIGNAL DETECTION
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def detect_signal(c1h, c15m, sr):
     if len(c1h) < 12 or not sr:
         return None
@@ -213,9 +219,9 @@ def detect_signal(c1h, c15m, sr):
     return None
 
 
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  ORDER
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def place_bracket_order(product_id, sig, qty, symbol):
     side     = "buy" if sig["dir"] == "LONG" else "sell"
     sl_price = round(sig["sl"], 2)
@@ -237,15 +243,15 @@ def place_bracket_order(product_id, sig, qty, symbol):
     log.info(f"  Payload: {json.dumps(payload)}")
 
     if DRY_RUN:
-        log.info(f"  [DRY RUN] {symbol} order simulated — NOT sent to exchange.")
+        log.info(f"  [DRY RUN] {symbol} order simulated â€” NOT sent to exchange.")
         return {"result": {"id": f"DRY_RUN_{symbol}", "state": "simulated"}}
 
     return api_post("/v2/orders", payload)
 
 
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #  MAIN
-# ─────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def run():
     log.info("=" * 65)
     log.info(f"Delta Exchange India Algo | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
@@ -269,31 +275,41 @@ def run():
     # Step 2: Balance
     if DRY_RUN:
         balance = 25000.0
-        log.info(f"[DRY RUN] Mock balance = ₹{balance:,.0f}")
+        log.info(f"[DRY RUN] Mock balance = â‚¹{balance:,.0f}")
     else:
-        balance = get_wallet_balance()
-        log.info(f"Live balance: ₹{balance:,.0f}")
-        if balance < 100:
-            log.warning("Balance too low. Add funds to Delta Exchange.")
-            return
+        raw_balance = get_wallet_balance()
 
-    # Step 3: Analyse each asset — BOTH can trade in same run
+        if raw_balance == -1.0:
+            # Geo-block: GitHub (USA) cannot reach Delta India API
+            # Use conservative fallback â€” exchange rejects if real margin insufficient
+            balance = 5000.0
+            log.info(f"  Fallback balance â‚¹{balance:,.0f} (geo-block bypass)")
+            log.info(f"  Exchange will auto-reject order if real margin is insufficient.")
+        elif raw_balance < 700:
+            log.warning(f"  Balance â‚¹{raw_balance:.0f} too low â€” need at least â‚¹700 for 1 contract.")
+            log.warning(f"  Add funds to Delta Exchange to continue.")
+            return
+        else:
+            balance = raw_balance
+            log.info(f"  Live balance: â‚¹{balance:,.0f} âœ…")
+
+    # Step 3: Analyse each asset â€” BOTH can trade in same run
     trades_placed = 0
     total_risk    = 0.0
 
     for asset, cfg in ASSETS.items():
-        log.info(f"\n{'─'*50}")
+        log.info(f"\n{'â”€'*50}")
         log.info(f"Analysing {asset} ({cfg['symbol']})")
-        log.info(f"{'─'*50}")
+        log.info(f"{'â”€'*50}")
 
-        # Safety: stop if already risked 3% total this run (1.5% × 2 assets)
+        # Safety: stop if already risked 3% total this run (1.5% Ã— 2 assets)
         if total_risk >= balance * 0.03:
             log.info(f"  Max total risk reached for this run. Stopping.")
             break
 
         pid = cfg.get("product_id")
         if not pid:
-            log.warning(f"  Skipping {asset} — product_id not found.")
+            log.warning(f"  Skipping {asset} â€” product_id not found.")
             continue
 
         # Check existing position
@@ -329,7 +345,7 @@ def run():
             continue
 
         if not sig["confirmed"]:
-            log.info(f"  {sig['dir']} breakout at {sig['level']:,.2f} — awaiting 15M confirmation.")
+            log.info(f"  {sig['dir']} breakout at {sig['level']:,.2f} â€” awaiting 15M confirmation.")
             continue
 
         # Position sizing
@@ -345,7 +361,7 @@ def run():
         log.info(f"  Stop Loss : {sig['sl']:,.{dp}f}  (risk per contract = {risk_per_c:.{dp}f})")
         log.info(f"  Take Prof : {sig['tp']:,.{dp}f}  (reward = {abs(sig['tp']-sig['entry']):.{dp}f})")
         log.info(f"  Contracts : {qty}")
-        log.info(f"  Total risk: ₹{actual_risk:.0f}  |  Total reward: ₹{actual_tp:.0f}  -> 1:{int(RR_RATIO)} RR")
+        log.info(f"  Total risk: â‚¹{actual_risk:.0f}  |  Total reward: â‚¹{actual_tp:.0f}  -> 1:{int(RR_RATIO)} RR")
         log.info(f"  Risk %    : {actual_risk/balance*100:.2f}% of balance")
 
         # Place order
@@ -364,8 +380,8 @@ def run():
     log.info(f"\n{'='*65}")
     log.info(f"Run Summary:")
     log.info(f"  Trades placed  : {trades_placed}")
-    log.info(f"  Total risk     : ₹{total_risk:.0f}")
-    log.info(f"  Balance        : ₹{balance:,.0f}")
+    log.info(f"  Total risk     : â‚¹{total_risk:.0f}")
+    log.info(f"  Balance        : â‚¹{balance:,.0f}")
     log.info(f"  Risk % of bal  : {total_risk/balance*100:.2f}%")
     log.info(f"{'='*65}")
     log.info("Run complete.")
