@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 # ─────────────────────────────────────────────────────────────
 API_KEY    = os.environ.get("DELTA_API_KEY",    "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
-BASE_URL   = "https://api.delta.exchange"
+BASE_URL   = "https://api.india.delta.exchange"
 
 ASSETS = {
     "BTC": {"symbol": "BTCUSDT", "product_id": None},   # filled at startup
