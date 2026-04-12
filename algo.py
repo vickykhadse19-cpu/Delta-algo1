@@ -80,7 +80,6 @@ def api_post(path, payload):
 #  MARKET DATA  (no auth needed)
 # ─────────────────────────────────────────────────────────────
 def get_product_id(symbol):
-    """Look up product_id for a symbol using tickers API."""
     try:
         url = f"{BASE_URL}/v2/tickers?contract_types=perpetual_futures"
         r   = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
@@ -94,14 +93,16 @@ def get_product_id(symbol):
 
 
 def get_candles(symbol, resolution, limit=110):
-    end   = int(time.time())
-    start = end - resolution * 60 * limit
-    url   = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution={resolution}&start={start}&end={end}"
-    r     = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
+    end     = int(time.time())
+    start   = end - resolution * 60 * limit
+    # Delta India uses string resolutions: 1m, 5m, 15m, 1h, 4h, 1d
+    res_str = {60: "1h", 15: "15m", 5: "5m", 1: "1m"}.get(resolution, str(resolution))
+    url     = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution={res_str}&start={start}&end={end}"
+    r       = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
     r.raise_for_status()
     raw = r.json().get("result", [])
     if not raw:
-        raise ValueError(f"No candles returned for {symbol} res={resolution}")
+        raise ValueError(f"No candles returned for {symbol} res={res_str}")
     candles = []
     for c in raw:
         try:
@@ -252,7 +253,7 @@ def run():
         log.error("API keys not set. Add DELTA_API_KEY and DELTA_API_SECRET to GitHub Secrets.")
         return
 
-    # Step 1 — Resolve product IDs via tickers (handles pagination automatically)
+    # Step 1: Resolve product IDs
     log.info("Resolving product IDs...")
     for asset, cfg in ASSETS.items():
         pid = get_product_id(cfg["symbol"])
@@ -262,7 +263,7 @@ def run():
         else:
             log.warning(f"  {asset}: {cfg['symbol']} not found in tickers")
 
-    # Step 2 — Balance (mock in dry run since no funds yet)
+    # Step 2: Balance
     if DRY_RUN:
         balance = 10000.0
         log.info(f"[DRY RUN] Mock balance = {balance:.2f} INR (no real funds needed for testing)")
@@ -273,7 +274,7 @@ def run():
             log.warning("Balance too low. Add funds to your Delta Exchange wallet.")
             return
 
-    # Step 3 — Analyse each asset
+    # Step 3: Analyse each asset
     for asset, cfg in ASSETS.items():
         log.info(f"\n{'─'*45}")
         log.info(f"Analysing {asset} ({cfg['symbol']})")
