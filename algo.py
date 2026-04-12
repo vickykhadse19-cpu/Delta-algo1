@@ -18,7 +18,7 @@ BASE_URL   = "https://api.delta.exchange"
 
 ASSETS = {
     "BTC": {"symbol": "BTCUSDT", "product_id": None},   # filled at startup
-    "ETH": {"symbol": "ETHUSD",  "product_id": None},
+    "ETH": {"symbol": "ETHUSDT", "product_id": None},
 }
 
 RISK_PERCENT   = 1.0    # % of available wallet balance to risk per trade
