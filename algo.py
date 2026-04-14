@@ -1,13 +1,47 @@
 """
-Delta Exchange India — BTC + ETH Pro Algo v8 Fixed
-===================================================
-FIXED: Removed bracket order — uses simple entry + SL + TP
-       This is the same method that worked for BTC/ETH LONG trades
+Delta Exchange India — BTC + ETH Ultimate Algo v9
+==================================================
+STRATEGY: EMA Trend + S/R Confluence
+
+Why this is better:
+  Old strategy waited for price to reach S/R levels
+  = sometimes waits days for a trade
+
+  New strategy uses EMA crossover on 15M chart
+  = signals happen multiple times per day
+  = trades with the current momentum
+  = S/R used as confirmation, not as trigger
+
+LOGIC:
+  LONG  : EMA9 crosses ABOVE EMA21 on 15M
+          + price above EMA50
+          + 5M candle confirms bullish
+          + NOT at a resistance level
+          → enter LONG immediately
+
+  SHORT : EMA9 crosses BELOW EMA21 on 15M
+          + price below EMA50
+          + 5M candle confirms bearish
+          + NOT at a support level
+          → enter SHORT immediately
+
+PROFIT:
+  RR     : 1:3 (faster, more frequent wins)
+  Risk   : 1.5% per trade
+  Trail  : 30% of move after 1x risk
+  
+  More trades × decent RR = more monthly profit
+  than fewer trades × high RR
+
+RUNS: Every 15 minutes on GitHub Actions (free)
 """
 
 import os, time, hmac, hashlib, json, requests, logging
 from datetime import datetime, timezone
 
+# ─────────────────────────────────────────────────────────────
+#  CONFIGURATION
+# ─────────────────────────────────────────────────────────────
 API_KEY    = os.environ.get("DELTA_API_KEY",    "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 BASE_URL   = "https://api.india.delta.exchange"
@@ -17,22 +51,19 @@ ASSETS = {
     "ETH": {"symbol": "ETHUSD", "product_id": None},
 }
 
-RISK_NORMAL    = 1.5
-RISK_STRONG    = 2.0
-MAX_TOTAL_RISK = 3.0
-RR_STRONG_4H   = 8.0
-RR_NORMAL_4H   = 6.0
-RR_1H          = 5.0
-TRAIL_TRIGGER  = 1.5
-TRAIL_DISTANCE = 0.35
-SR_LOOKBACK       = 5
-SR_CLUSTER_TOL    = 0.003
-MIN_BREAK_PCT     = 0.0005
-MAX_BREAK_PCT     = 0.05
-MAX_SL_PCT        = 0.06
-MIN_BODY_PCT      = 0.35
-VOL_MULTIPLIER    = 1.2
-STRONG_STRENGTH   = 3
+RISK_PERCENT   = 1.5    # % per trade
+RR_RATIO       = 3.0    # 1:3 — achievable, frequent
+TRAIL_TRIGGER  = 1.0    # trail after 1x risk in profit
+TRAIL_DISTANCE = 0.30   # 30% of move
+MAX_TOTAL_RISK = 3.0    # max % per run
+MAX_SL_PCT     = 0.04   # SL max 4% away
+SR_LOOKBACK    = 5
+SR_CLUSTER_TOL = 0.003
+
+# EMA periods
+EMA_FAST   = 9
+EMA_SLOW   = 21
+EMA_TREND  = 50
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
@@ -41,9 +72,12 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("delta_v8")
+log = logging.getLogger("delta_v9")
 
 
+# ─────────────────────────────────────────────────────────────
+#  AUTH
+# ─────────────────────────────────────────────────────────────
 def auth_headers(method, path, qs="", body=""):
     ts  = str(int(time.time()))
     msg = method + ts + path + ("?" + qs if qs else "") + body
@@ -77,6 +111,9 @@ def api_put(path, payload):
     return r.json()
 
 
+# ─────────────────────────────────────────────────────────────
+#  MARKET DATA
+# ─────────────────────────────────────────────────────────────
 def get_product_id(symbol):
     try:
         r = requests.get(
@@ -150,7 +187,36 @@ def get_open_orders(product_id):
         return []
 
 
-def detect_sr_levels(candles, label=""):
+# ─────────────────────────────────────────────────────────────
+#  EMA CALCULATION
+# ─────────────────────────────────────────────────────────────
+def ema(prices, period):
+    """Exponential Moving Average."""
+    if len(prices) < period:
+        return None
+    k   = 2 / (period + 1)
+    val = sum(prices[:period]) / period  # SMA for seed
+    for p in prices[period:]:
+        val = p * k + val * (1 - k)
+    return val
+
+def calculate_emas(candles):
+    """Returns dict of current EMA values."""
+    closes = [c["close"] for c in candles]
+    return {
+        "fast":  ema(closes, EMA_FAST),
+        "slow":  ema(closes, EMA_SLOW),
+        "trend": ema(closes, EMA_TREND),
+        # Previous candle EMAs for crossover detection
+        "fast_prev":  ema(closes[:-1], EMA_FAST)  if len(closes) > EMA_FAST  else None,
+        "slow_prev":  ema(closes[:-1], EMA_SLOW)  if len(closes) > EMA_SLOW  else None,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+#  S/R DETECTION  (used as filter — avoid entering at wall)
+# ─────────────────────────────────────────────────────────────
+def detect_sr_levels(candles):
     raw, n, lb = [], len(candles), SR_LOOKBACK
     for i in range(lb, n - lb):
         c = candles[i]
@@ -169,129 +235,182 @@ def detect_sr_levels(candles, label=""):
             "price":    sum(cluster) / len(cluster),
             "type":     a["type"],
             "strength": len(cluster),
-            "tf":       label,
         })
     return sorted(out, key=lambda x: -x["strength"])[:15]
 
 
-def merge_sr_levels(sr_4h, sr_1h, px):
-    all_levels = []
-    for l in sr_4h:
-        if abs(l["price"] - px) / px <= 0.08:
-            all_levels.append(l)
-    for l in sr_1h:
-        if abs(l["price"] - px) / px > 0.06:
+def is_near_sr_wall(px, sr_levels, direction, tolerance=0.005):
+    """
+    Returns True if price is within 0.5% of a wall that would block the trade.
+    LONG blocked by resistance above.
+    SHORT blocked by support below.
+    """
+    for l in sr_levels:
+        dist = abs(l["price"] - px) / px
+        if dist > tolerance:
             continue
-        is_dup = any(abs(l["price"] - e["price"]) / e["price"] < SR_CLUSTER_TOL
-                     for e in all_levels)
-        if not is_dup:
-            all_levels.append(l)
-    return sorted(all_levels, key=lambda x: -x["strength"])
+        if direction == "LONG" and l["type"] == "R" and l["price"] > px:
+            return True, l["price"]
+        if direction == "SHORT" and l["type"] == "S" and l["price"] < px:
+            return True, l["price"]
+    return False, None
 
 
-def get_4h_trend(c4h):
-    if len(c4h) < 4: return "NEUTRAL"
-    last3   = c4h[-3:]
-    bullish = sum(1 for c in last3 if c["close"] > c["open"])
-    bearish = sum(1 for c in last3 if c["close"] < c["open"])
-    if bullish >= 2: return "BULL"
-    if bearish >= 2: return "BEAR"
-    return "NEUTRAL"
+# ─────────────────────────────────────────────────────────────
+#  VOLUME ANALYSIS
+# ─────────────────────────────────────────────────────────────
+def is_volume_ok(candles, multiplier=1.0):
+    """Volume on last candle should be above average."""
+    if len(candles) < 20:
+        return True
+    avg = sum(c["volume"] for c in candles[-20:-1]) / 19
+    return candles[-1]["volume"] >= avg * multiplier
 
 
-def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
-    if len(c15m) < 2 or len(c5m) < 2 or not sr_combined:
+# ─────────────────────────────────────────────────────────────
+#  SIGNAL DETECTION — EMA CROSSOVER + TREND + S/R FILTER
+#
+#  LONG conditions:
+#   1. EMA9 just crossed ABOVE EMA21 (on 15M)
+#   2. Price is ABOVE EMA50 (uptrend)
+#   3. 5M candle is bullish (close > open)
+#   4. Not within 0.5% of a resistance level
+#   5. Volume >= average
+#
+#  SHORT conditions:
+#   1. EMA9 just crossed BELOW EMA21 (on 15M)
+#   2. Price is BELOW EMA50 (downtrend)
+#   3. 5M candle is bearish (close < open)
+#   4. Not within 0.5% of a support level
+#   5. Volume >= average
+#
+#  SL placement:
+#   LONG  → SL below EMA21 (natural support)
+#   SHORT → SL above EMA21 (natural resistance)
+# ─────────────────────────────────────────────────────────────
+def detect_signal(c15m, c5m, sr_1h, sr_4h):
+    if len(c15m) < EMA_TREND + 5 or len(c5m) < 3:
         return None
 
-    c15_curr = c15m[-1]
-    c5_curr  = c5m[-1]
-    px       = c5_curr["close"]
-    trend    = get_4h_trend(c4h)
+    curr_15m = c15m[-1]
+    curr_5m  = c5m[-1]
+    px       = curr_5m["close"]
 
-    avg_vol  = (sum(c["volume"] for c in c15m[-20:]) / 20
-                if len(c15m) >= 20 else 0)
-    high_vol = c15_curr["volume"] >= avg_vol * VOL_MULTIPLIER if avg_vol > 0 else False
+    # Calculate EMAs on 15M
+    e = calculate_emas(c15m)
+    if not all([e["fast"], e["slow"], e["trend"],
+                e["fast_prev"], e["slow_prev"]]):
+        return None
 
-    def body_pct(c):
-        rng = c["high"] - c["low"]
-        return abs(c["close"] - c["open"]) / rng if rng > 0 else 0
+    # Combine S/R from both timeframes
+    all_sr = sr_4h + [l for l in sr_1h
+                      if not any(abs(l["price"] - s["price"]) / s["price"] < SR_CLUSTER_TOL
+                                 for s in sr_4h)]
 
-    def get_rr_and_risk(level_data):
-        is_4h    = level_data["tf"] == "4H"
-        strength = level_data["strength"]
-        is_strong = (is_4h and strength >= STRONG_STRENGTH
-                     and high_vol and trend in ("BULL", "BEAR"))
-        if is_strong:
-            return RR_STRONG_4H, RISK_STRONG, "STRONG ⚡"
-        elif is_4h:
-            return RR_NORMAL_4H, RISK_NORMAL, "NORMAL 4H"
+    dp = 1 if px > 1000 else 2
+
+    log.info(f"  EMA9={e['fast']:.{dp}f} | EMA21={e['slow']:.{dp}f} | "
+             f"EMA50={e['trend']:.{dp}f}")
+
+    # ── LONG ─────────────────────────────────────────────────
+    # EMA9 crossed above EMA21
+    crossed_up = (e["fast_prev"] <= e["slow_prev"] and
+                  e["fast"]      >  e["slow"])
+
+    if crossed_up:
+        log.info(f"  EMA9 crossed ABOVE EMA21 ← bullish crossover!")
+
+        # Price must be above EMA50 (uptrend)
+        if px < e["trend"] * 0.998:
+            log.info(f"  LONG blocked — price below EMA50 ({e['trend']:.{dp}f})")
         else:
-            return RR_1H, RISK_NORMAL, "NORMAL 1H"
-
-    if trend != "BEAR":
-        resistances = sorted(
-            [l for l in sr_combined if l["type"] == "R" and l["price"] > px * 0.99],
-            key=lambda x: x["price"]
-        )
-        for res in resistances[:8]:
-            level = res["price"]
-            brk   = (c15_curr["close"] - level) / level
-            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT): continue
-            if body_pct(c15_curr) < MIN_BODY_PCT: continue
-            if c5_curr["close"] > level * 1.0002:
-                entry = c5_curr["close"]
-                sl    = min(level * 0.997, c15_curr["low"], c5_curr["low"])
-                risk  = entry - sl
-                if risk <= 0 or risk / entry > MAX_SL_PCT: continue
-                rr, rsk, grade = get_rr_and_risk(res)
-                return {
-                    "dir": "LONG", "entry": entry, "sl": sl,
-                    "tp": entry + risk * rr, "level": level,
-                    "risk": risk, "rr": rr, "risk_pct": rsk,
-                    "confirmed": True, "grade": grade,
-                    "level_tf": res["tf"], "strength": res["strength"],
-                    "vol": "HIGH" if high_vol else "normal", "trend": trend,
-                }
+            # 5M candle must be bullish
+            if curr_5m["close"] <= curr_5m["open"]:
+                log.info(f"  LONG blocked — 5M candle bearish")
             else:
-                return {
-                    "dir": "LONG", "confirmed": False, "level": level,
-                    "level_tf": res["tf"],
-                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
-                }
+                # Volume check
+                if not is_volume_ok(c15m, 0.8):
+                    log.info(f"  LONG blocked — volume too low")
+                else:
+                    # Not near resistance
+                    blocked, wall = is_near_sr_wall(px, all_sr, "LONG")
+                    if blocked:
+                        log.info(f"  LONG blocked — resistance at {wall:.{dp}f}")
+                    else:
+                        # Calculate SL below EMA21
+                        sl   = min(e["slow"] * 0.998, curr_15m["low"])
+                        risk = px - sl
+                        if 0 < risk / px < MAX_SL_PCT:
+                            return {
+                                "dir":       "LONG",
+                                "entry":     px,
+                                "sl":        round(sl, 2),
+                                "tp":        round(px + risk * RR_RATIO, 2),
+                                "risk":      risk,
+                                "confirmed": True,
+                                "signal":    "EMA9 x EMA21 BULL",
+                                "ema_fast":  e["fast"],
+                                "ema_slow":  e["slow"],
+                                "ema_trend": e["trend"],
+                            }
 
-    if trend != "BULL":
-        supports = sorted(
-            [l for l in sr_combined if l["type"] == "S" and l["price"] < px * 1.01],
-            key=lambda x: -x["price"]
-        )
-        for sup in supports[:8]:
-            level = sup["price"]
-            brk   = (level - c15_curr["close"]) / level
-            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT): continue
-            if body_pct(c15_curr) < MIN_BODY_PCT: continue
-            if c5_curr["close"] < level * 0.9998:
-                entry = c5_curr["close"]
-                sl    = max(level * 1.003, c15_curr["high"], c5_curr["high"])
-                risk  = sl - entry
-                if risk <= 0 or risk / entry > MAX_SL_PCT: continue
-                rr, rsk, grade = get_rr_and_risk(sup)
-                return {
-                    "dir": "SHORT", "entry": entry, "sl": sl,
-                    "tp": entry - risk * rr, "level": level,
-                    "risk": risk, "rr": rr, "risk_pct": rsk,
-                    "confirmed": True, "grade": grade,
-                    "level_tf": sup["tf"], "strength": sup["strength"],
-                    "vol": "HIGH" if high_vol else "normal", "trend": trend,
-                }
+    # ── SHORT ────────────────────────────────────────────────
+    # EMA9 crossed below EMA21
+    crossed_dn = (e["fast_prev"] >= e["slow_prev"] and
+                  e["fast"]      <  e["slow"])
+
+    if crossed_dn:
+        log.info(f"  EMA9 crossed BELOW EMA21 ← bearish crossover!")
+
+        # Price must be below EMA50 (downtrend)
+        if px > e["trend"] * 1.002:
+            log.info(f"  SHORT blocked — price above EMA50 ({e['trend']:.{dp}f})")
+        else:
+            # 5M candle must be bearish
+            if curr_5m["close"] >= curr_5m["open"]:
+                log.info(f"  SHORT blocked — 5M candle bullish")
             else:
-                return {
-                    "dir": "SHORT", "confirmed": False, "level": level,
-                    "level_tf": sup["tf"],
-                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
-                }
+                # Volume check
+                if not is_volume_ok(c15m, 0.8):
+                    log.info(f"  SHORT blocked — volume too low")
+                else:
+                    # Not near support
+                    blocked, wall = is_near_sr_wall(px, all_sr, "SHORT")
+                    if blocked:
+                        log.info(f"  SHORT blocked — support at {wall:.{dp}f}")
+                    else:
+                        # SL above EMA21
+                        sl   = max(e["slow"] * 1.002, curr_15m["high"])
+                        risk = sl - px
+                        if 0 < risk / px < MAX_SL_PCT:
+                            return {
+                                "dir":       "SHORT",
+                                "entry":     px,
+                                "sl":        round(sl, 2),
+                                "tp":        round(px - risk * RR_RATIO, 2),
+                                "risk":      risk,
+                                "confirmed": True,
+                                "signal":    "EMA9 x EMA21 BEAR",
+                                "ema_fast":  e["fast"],
+                                "ema_slow":  e["slow"],
+                                "ema_trend": e["trend"],
+                            }
+
+    if not crossed_up and not crossed_dn:
+        # Check if already in crossover (not just happened)
+        if e["fast"] > e["slow"] and px > e["trend"]:
+            log.info(f"  EMA9 > EMA21, price > EMA50 — uptrend, waiting fresh cross")
+        elif e["fast"] < e["slow"] and px < e["trend"]:
+            log.info(f"  EMA9 < EMA21, price < EMA50 — downtrend, waiting fresh cross")
+        else:
+            log.info(f"  No crossover — EMAs not aligned")
+
     return None
 
 
+# ─────────────────────────────────────────────────────────────
+#  TRAILING STOP
+# ─────────────────────────────────────────────────────────────
 def calculate_trail_sl(direction, entry, current_sl, orig_risk, px):
     if direction == "LONG":
         if px - entry < orig_risk * TRAIL_TRIGGER: return None
@@ -350,43 +469,34 @@ def manage_open_positions(open_positions, c5m_by_asset):
 
 # ─────────────────────────────────────────────────────────────
 #  ORDER PLACEMENT
-#  Step 1: Market entry order
-#  Step 2: Stop Loss order  (placed 2 sec after entry fills)
-#  Step 3: Take Profit order
-#  This is the SAME method that worked for previous BTC/ETH trades
 # ─────────────────────────────────────────────────────────────
 def place_order(product_id, sig, qty, symbol):
     side     = "buy"  if sig["dir"] == "LONG"  else "sell"
     close    = "sell" if sig["dir"] == "LONG"  else "buy"
-    sl_price = round(sig["sl"], 2)
-    tp_price = round(sig["tp"], 2)
+    sl_price = sig["sl"]
+    tp_price = sig["tp"]
     dp       = 1 if sig["entry"] > 1000 else 2
 
     if DRY_RUN:
         log.info(f"  [DRY RUN] {symbol} {sig['dir']}")
         log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | "
-                 f"TP={tp_price} | RR=1:{int(sig['rr'])}")
-        log.info(f"  SL and TP will be set automatically after entry fills")
+                 f"TP={tp_price} | RR=1:{int(RR_RATIO)}")
         return True
 
     try:
-        # Step 1 — Entry order
-        entry_resp = api_post("/v2/orders", {
+        # Entry
+        er = api_post("/v2/orders", {
             "product_id":    product_id,
             "size":          qty,
             "side":          side,
             "order_type":    "market_order",
             "time_in_force": "gtc",
         })
-        order_id = entry_resp.get("result", {}).get("id", "?")
-        log.info(f"  ✅ Entry placed! ID={order_id}")
-        log.info(f"  Entry={sig['entry']:.{dp}f}")
-
-        # Wait for entry to fill
+        log.info(f"  ✅ Entry! ID={er.get('result',{}).get('id','?')}")
         time.sleep(3)
 
-        # Step 2 — Stop Loss order
-        sl_resp = api_post("/v2/orders", {
+        # Stop Loss
+        api_post("/v2/orders", {
             "product_id":       product_id,
             "size":             qty,
             "side":             close,
@@ -395,10 +505,10 @@ def place_order(product_id, sig, qty, symbol):
             "stop_price":       str(sl_price),
             "close_on_trigger": True,
         })
-        log.info(f"  ✅ Stop Loss set at {sl_price}")
+        log.info(f"  ✅ SL set at {sl_price}")
 
-        # Step 3 — Take Profit order
-        tp_resp = api_post("/v2/orders", {
+        # Take Profit
+        api_post("/v2/orders", {
             "product_id":       product_id,
             "size":             qty,
             "side":             close,
@@ -407,41 +517,43 @@ def place_order(product_id, sig, qty, symbol):
             "stop_price":       str(tp_price),
             "close_on_trigger": True,
         })
-        log.info(f"  ✅ Take Profit set at {tp_price}")
-        log.info(f"  ══════════════════════════════════════")
-        log.info(f"  {sig['dir']} {symbol} ORDER COMPLETE")
+        log.info(f"  ✅ TP set at {tp_price}")
+        log.info(f"  ══════════════════════════════")
+        log.info(f"  {sig['dir']} {symbol} COMPLETE")
         log.info(f"  Entry : {sig['entry']:.{dp}f}")
-        log.info(f"  SL    : {sl_price}  ← auto closes if loss")
-        log.info(f"  TP    : {tp_price}  ← auto closes if profit")
-        log.info(f"  RR    : 1:{int(sig['rr'])}")
-        log.info(f"  ══════════════════════════════════════")
+        log.info(f"  SL    : {sl_price}")
+        log.info(f"  TP    : {tp_price}")
+        log.info(f"  RR    : 1:{int(RR_RATIO)}")
+        log.info(f"  ══════════════════════════════")
         return True
 
     except requests.HTTPError as e:
         err = e.response.text if e.response else str(e)
-        log.error(f"  ❌ Order failed: {err}")
-        log.error(f"  SET MANUALLY on Delta Exchange app:")
-        log.error(f"  Direction : {sig['dir']}")
-        log.error(f"  SL        : {sl_price}")
-        log.error(f"  TP        : {tp_price}")
+        log.error(f"  ❌ Failed: {err}")
+        log.error(f"  MANUAL: SL={sl_price} TP={tp_price}")
         return False
     except Exception as e:
         log.error(f"  ❌ Error: {e}")
-        log.error(f"  SET MANUALLY — SL={sl_price}  TP={tp_price}")
         return False
 
 
+# ─────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────
 def run():
     log.info("=" * 65)
-    log.info(f"Delta Pro v8 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | "
-             f"RR=1:5/1:6/1:8 | Trail@35% | 4H+1H levels | 15M+5M entry")
+    log.info(f"Delta Ultimate v9 | "
+             f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | Risk={RISK_PERCENT}% | "
+             f"RR=1:{int(RR_RATIO)} | Trail@{int(TRAIL_DISTANCE*100)}% | "
+             f"EMA{EMA_FAST}/EMA{EMA_SLOW}/EMA{EMA_TREND} + S/R filter")
     log.info("=" * 65)
 
     if not API_KEY or not API_SECRET:
         log.error("API keys not set.")
         return
 
+    # Product IDs
     log.info("Resolving product IDs...")
     for asset, cfg in ASSETS.items():
         pid = get_product_id(cfg["symbol"])
@@ -451,6 +563,7 @@ def run():
         else:
             log.warning(f"  {asset}: not found")
 
+    # Balance
     if DRY_RUN:
         balance = 25000.0
         log.info(f"[DRY RUN] Mock balance = Rs.{balance:,.0f}")
@@ -466,6 +579,7 @@ def run():
             balance = raw_bal
             log.info(f"  Live balance: Rs.{balance:,.0f}")
 
+    # Candles
     c4h_by  = {}
     c1h_by  = {}
     c15m_by = {}
@@ -479,11 +593,13 @@ def run():
         except Exception as e:
             log.error(f"  Candle error {asset}: {e}")
 
+    # Manage open positions
     if not DRY_RUN:
         open_pos = get_open_positions()
         if open_pos:
             manage_open_positions(open_pos, c5m_by)
 
+    # Scan
     trades_placed = 0
     total_risk    = 0.0
 
@@ -510,59 +626,43 @@ def run():
         c15m = c15m_by.get(asset, [])
         c5m  = c5m_by.get(asset,  [])
 
-        if not c4h or not c1h or not c15m or not c5m:
-            continue
+        if not c15m or not c5m: continue
 
-        px    = c5m[-1]["close"]
-        trend = get_4h_trend(c4h)
-        dp    = 1 if px > 1000 else 2
+        px = c5m[-1]["close"]
+        dp = 1 if px > 1000 else 2
 
-        log.info(f"  Price    : {px:,.2f}")
-        log.info(f"  4H Trend : {trend}")
-        log.info(f"  Candles  : {len(c4h)}x4H | {len(c1h)}x1H | "
+        log.info(f"  Price  : {px:,.2f}")
+        log.info(f"  Candles: {len(c4h)}x4H | {len(c1h)}x1H | "
                  f"{len(c15m)}x15M | {len(c5m)}x5M")
 
-        sr_4h = detect_sr_levels(c4h, "4H")
-        sr_1h = detect_sr_levels(c1h, "1H")
-        sr    = merge_sr_levels(sr_4h, sr_1h, px)
+        # S/R for filtering
+        sr_4h = detect_sr_levels(c4h) if c4h else []
+        sr_1h = detect_sr_levels(c1h) if c1h else []
 
-        log.info(f"  S/R: {len([l for l in sr if l['tf']=='4H'])} from 4H "
-                 f"+ {len([l for l in sr if l['tf']=='1H'])} from 1H "
-                 f"= {len(sr)} total")
-
-        for lv in sr[:8]:
-            dist = (lv['price'] - px) / px * 100
-            tag  = " ← STRONG" if lv["strength"] >= STRONG_STRENGTH else ""
-            log.info(f"    [{lv['tf']}] {lv['type']} {lv['price']:,.{dp}f} "
-                     f"(str={lv['strength']}) {dist:+.2f}%{tag}")
-
-        sig = detect_signal(c4h, c1h, c15m, c5m, sr)
+        # Signal
+        sig = detect_signal(c15m, c5m, sr_1h, sr_4h)
 
         if not sig:
-            log.info(f"  No signal.")
             continue
 
-        if not sig["confirmed"]:
-            log.info(f"  {sig['dir']} near [{sig['level_tf']}] "
-                     f"{sig['level']:,.{dp}f} — {sig.get('msg','...')}")
-            continue
-
-        risk_budget = balance * sig["risk_pct"] / 100
+        # Position sizing
+        risk_budget = balance * RISK_PERCENT / 100
         risk_per_c  = abs(sig["entry"] - sig["sl"])
         qty         = max(1, int(risk_budget / risk_per_c)) if risk_per_c > 0 else 1
         actual_risk = qty * risk_per_c
         actual_tp   = qty * abs(sig["tp"] - sig["entry"])
 
-        log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{sig['grade']}] ***")
-        log.info(f"  Level TF   : {sig['level_tf']} at {sig['level']:,.{dp}f}")
-        log.info(f"  4H Trend   : {sig['trend']}")
-        log.info(f"  Volume     : {sig['vol']}")
-        log.info(f"  Entry      : {sig['entry']:,.{dp}f}")
-        log.info(f"  Stop Loss  : {round(sig['sl'],2)}  ← set automatically")
-        log.info(f"  Take Profit: {round(sig['tp'],2)}  ← set automatically  (1:{int(sig['rr'])} RR)")
-        log.info(f"  Risk       : Rs.{actual_risk:.0f}")
-        log.info(f"  Reward     : Rs.{actual_tp:.0f}")
-        log.info(f"  Contracts  : {qty}")
+        log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} ***")
+        log.info(f"  Signal  : {sig['signal']}")
+        log.info(f"  EMA9    : {sig['ema_fast']:.{dp}f}")
+        log.info(f"  EMA21   : {sig['ema_slow']:.{dp}f}")
+        log.info(f"  EMA50   : {sig['ema_trend']:.{dp}f}")
+        log.info(f"  Entry   : {sig['entry']:.{dp}f}")
+        log.info(f"  SL      : {sig['sl']:.{dp}f}  ← auto set")
+        log.info(f"  TP      : {sig['tp']:.{dp}f}  ← auto set (1:{int(RR_RATIO)} RR)")
+        log.info(f"  Risk    : Rs.{actual_risk:.0f} ({RISK_PERCENT}%)")
+        log.info(f"  Reward  : Rs.{actual_tp:.0f}")
+        log.info(f"  Qty     : {qty} contracts")
 
         success = place_order(pid, sig, qty, asset)
         if success:
