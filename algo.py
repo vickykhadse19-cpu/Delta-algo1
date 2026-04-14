@@ -1,14 +1,30 @@
 """
-Delta Exchange India — BTC + ETH Multi-Timeframe Breakout Algo v4
-=================================================================
-Strategy : 4H S/R detection -> 1H confirm -> 15M entry
-           RR Ratio : 1:6  (better for 4H moves)
-           Trailing Stop : moves SL up as price moves in favor
-           Not too tight — trails at 40% of move
-Exchange : Delta Exchange India
-Assets   : BTCUSD + ETHUSD
-Risk     : 1.5% per trade
-Runs     : Every 15 minutes via GitHub Actions
+Delta Exchange India — BTC + ETH Professional Algo v7
+=====================================================
+Built for maximum profitability:
+
+ENTRY:
+  4H S/R zones  (strongest levels — institutional zones)
+  15M candle breaks level with strong body  (breakout)
+  5M candle confirms direction  (fast entry — 5-10 min)
+  Volume above average on breakout  (real move filter)
+  4H trend alignment  (trade with the big money)
+
+EXIT:
+  Dynamic RR:
+    Normal signal  → 1:6 RR
+    Strong signal  → 1:8 RR  (high strength level + volume)
+  Trailing stop at 35% of move (locks more profit)
+  Trail activates after 1.5x risk (earlier protection)
+
+RISK:
+  Strong signal  → 2.0% of balance
+  Normal signal  → 1.5% of balance
+  Max 3% total per run
+
+SPEED:
+  Scans every 15 min  (free on GitHub — 1,440 min/month)
+  Entry within 5-10 min of breakout
 """
 
 import os, time, hmac, hashlib, json, requests, logging
@@ -26,17 +42,28 @@ ASSETS = {
     "ETH": {"symbol": "ETHUSD", "product_id": None},
 }
 
-RISK_PERCENT   = 1.5
-RR_RATIO       = 6.0    # upgraded from 4.0 → better for 4H moves
-TRAIL_TRIGGER  = 2.0    # start trailing only after 2x risk is in profit
-                        # prevents premature trailing on small moves
-TRAIL_DISTANCE = 0.4    # trail SL at 40% below highest point
-                        # not too tight — gives trade room to breathe
-SR_LOOKBACK    = 5
-SR_CLUSTER_TOL = 0.003
-MIN_BREAK_PCT  = 0.001
-MAX_BREAK_PCT  = 0.04
-MAX_SL_PCT     = 0.06
+# Risk settings
+RISK_NORMAL    = 1.5   # % for normal signals
+RISK_STRONG    = 2.0   # % for strong signals (high str level + volume)
+MAX_TOTAL_RISK = 3.0   # % max per run
+
+# RR settings
+RR_NORMAL  = 6.0   # 1:6 for normal signals
+RR_STRONG  = 8.0   # 1:8 for strong signals
+
+# Trailing stop
+TRAIL_TRIGGER  = 1.5   # earlier — activates after 1.5x risk in profit
+TRAIL_DISTANCE = 0.35  # 35% of move — slightly tighter than 40%
+
+# Signal filters
+SR_LOOKBACK       = 5
+SR_CLUSTER_TOL    = 0.003
+MIN_BREAK_PCT     = 0.0005
+MAX_BREAK_PCT     = 0.05
+MAX_SL_PCT        = 0.06
+MIN_BODY_PCT      = 0.40   # 15M candle body must be >40% of range
+VOL_MULTIPLIER    = 1.3    # volume must be 1.3x average for strong signal
+STRONG_STRENGTH   = 3      # S/R level strength >= 3 = strong signal
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
@@ -45,29 +72,19 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("delta_algo_v4")
+log = logging.getLogger("delta_pro")
 
 
 # ─────────────────────────────────────────────────────────────
 #  AUTH
 # ─────────────────────────────────────────────────────────────
-def auth_headers(method, path, query_string="", body=""):
-    timestamp = str(int(time.time()))
-    message   = method + timestamp + path
-    if query_string:
-        message += "?" + query_string
-    message  += body
-    signature = hmac.new(
-        API_SECRET.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+def auth_headers(method, path, qs="", body=""):
+    ts  = str(int(time.time()))
+    msg = method + ts + path + ("?" + qs if qs else "") + body
+    sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
     return {
-        "api-key":      API_KEY,
-        "timestamp":    timestamp,
-        "signature":    signature,
-        "Content-Type": "application/json",
-        "Accept":       "application/json",
+        "api-key": API_KEY, "timestamp": ts, "signature": sig,
+        "Content-Type": "application/json", "Accept": "application/json",
     }
 
 def api_get(path, params=None):
@@ -79,23 +96,17 @@ def api_get(path, params=None):
 
 def api_post(path, payload):
     body = json.dumps(payload, separators=(",", ":"))
-    r    = requests.post(
-        BASE_URL + path,
-        headers=auth_headers("POST", path, "", body),
-        data=body,
-        timeout=15
-    )
+    r    = requests.post(BASE_URL + path,
+                         headers=auth_headers("POST", path, "", body),
+                         data=body, timeout=15)
     r.raise_for_status()
     return r.json()
 
 def api_put(path, payload):
     body = json.dumps(payload, separators=(",", ":"))
-    r    = requests.put(
-        BASE_URL + path,
-        headers=auth_headers("PUT", path, "", body),
-        data=body,
-        timeout=15
-    )
+    r    = requests.put(BASE_URL + path,
+                        headers=auth_headers("PUT", path, "", body),
+                        data=body, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -105,32 +116,33 @@ def api_put(path, payload):
 # ─────────────────────────────────────────────────────────────
 def get_product_id(symbol):
     try:
-        url = f"{BASE_URL}/v2/tickers?contract_types=perpetual_futures"
-        r   = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
+        r = requests.get(
+            f"{BASE_URL}/v2/tickers?contract_types=perpetual_futures",
+            headers={"Accept": "application/json"}, timeout=15)
         r.raise_for_status()
         for t in r.json().get("result", []):
             if t.get("symbol") == symbol:
                 return t.get("product_id")
     except Exception as e:
-        log.warning(f"  Ticker lookup failed: {e}")
+        log.warning(f"  Ticker lookup: {e}")
     return None
-
 
 def get_candles(symbol, resolution, limit=150):
     end     = int(time.time())
     start   = end - resolution * 60 * limit
     res_map = {240: "4h", 60: "1h", 15: "15m", 5: "5m", 1: "1m"}
     res_str = res_map.get(resolution, str(resolution))
-    url     = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution={res_str}&start={start}&end={end}"
-    r       = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
+    url     = (f"{BASE_URL}/v2/history/candles?"
+               f"symbol={symbol}&resolution={res_str}&start={start}&end={end}")
+    r = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
     r.raise_for_status()
     raw = r.json().get("result", [])
     if not raw:
-        raise ValueError(f"No candles for {symbol} {res_str}")
-    candles = []
+        raise ValueError(f"No candles: {symbol} {res_str}")
+    out = []
     for c in raw:
         try:
-            candles.append({
+            out.append({
                 "time":   int(c["time"]),
                 "open":   float(c["open"]),
                 "high":   float(c["high"]),
@@ -140,8 +152,7 @@ def get_candles(symbol, resolution, limit=150):
             })
         except Exception:
             continue
-    return sorted(candles, key=lambda x: x["time"])
-
+    return sorted(out, key=lambda x: x["time"])
 
 def get_wallet_balance():
     try:
@@ -149,53 +160,44 @@ def get_wallet_balance():
         for b in data.get("result", []):
             val = float(b.get("available_balance", 0) or 0)
             if val > 0:
-                log.info(f"  Asset: {b.get('asset_symbol')}  Balance: {val:.2f}")
+                log.info(f"  {b.get('asset_symbol')} balance: {val:.2f}")
                 return val
         return 0.0
     except Exception as e:
-        log.warning(f"  Balance fetch failed ({e}) — using fallback")
+        log.warning(f"  Balance failed — geo-block bypass active")
         return -1.0
 
-
 def get_open_positions():
-    """Returns all open positions as dict keyed by product_id."""
     try:
-        data = api_get("/v2/positions/margined")
+        data   = api_get("/v2/positions/margined")
         result = data.get("result", [])
         if isinstance(result, list):
-            return {
-                p["product_id"]: p
-                for p in result
-                if float(p.get("size", 0) or 0) != 0
-            }
+            return {p["product_id"]: p for p in result
+                    if float(p.get("size", 0) or 0) != 0}
         return {}
     except Exception:
         return {}
 
-
 def get_open_orders(product_id):
-    """Get open stop/tp orders for a product."""
     try:
-        data = api_get("/v2/orders", {
-            "product_id": product_id,
-            "state": "open",
-        })
-        return data.get("result", [])
+        return api_get("/v2/orders", {
+            "product_id": product_id, "state": "open"
+        }).get("result", [])
     except Exception:
         return []
 
 
 # ─────────────────────────────────────────────────────────────
-#  S/R DETECTION  (4H candles = strongest zones)
+#  S/R DETECTION  (4H = institutional levels)
 # ─────────────────────────────────────────────────────────────
 def detect_sr_levels(candles):
     raw, n, lb = [], len(candles), SR_LOOKBACK
     for i in range(lb, n - lb):
-        c     = candles[i]
-        is_hi = all(candles[j]["high"] < c["high"] for j in range(i-lb, i+lb+1) if j != i)
-        is_lo = all(candles[j]["low"]  > c["low"]  for j in range(i-lb, i+lb+1) if j != i)
-        if is_hi: raw.append({"price": c["high"], "type": "R"})
-        if is_lo: raw.append({"price": c["low"],  "type": "S"})
+        c = candles[i]
+        if all(candles[j]["high"] < c["high"] for j in range(i-lb, i+lb+1) if j != i):
+            raw.append({"price": c["high"], "type": "R"})
+        if all(candles[j]["low"] > c["low"] for j in range(i-lb, i+lb+1) if j != i):
+            raw.append({"price": c["low"], "type": "S"})
 
     used, out = set(), []
     for i, a in enumerate(raw):
@@ -213,161 +215,257 @@ def detect_sr_levels(candles):
 
 
 # ─────────────────────────────────────────────────────────────
-#  SIGNAL DETECTION  (4H + 1H + 15M)
+#  4H TREND DETECTION
+#  Simple: last 4H candle direction = short-term 4H trend
+#  Plus: last 3 4H candles — majority direction
 # ─────────────────────────────────────────────────────────────
-def detect_signal(c4h, c1h, c15m, sr):
-    if len(c4h) < 10 or len(c1h) < 10 or not sr:
+def get_4h_trend(c4h):
+    if len(c4h) < 4:
+        return "NEUTRAL"
+    last3 = c4h[-3:]
+    bullish = sum(1 for c in last3 if c["close"] > c["open"])
+    bearish = sum(1 for c in last3 if c["close"] < c["open"])
+    if bullish >= 2:
+        return "BULL"
+    if bearish >= 2:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+# ─────────────────────────────────────────────────────────────
+#  SIGNAL DETECTION — PROFESSIONAL VERSION
+#
+#  Filters applied:
+#  1. 4H level must exist near price
+#  2. 15M candle must CLOSE beyond level (not just wick)
+#  3. 15M candle body must be strong (>40% of range)
+#  4. 5M candle confirms direction
+#  5. Volume above average on 15M breakout candle
+#  6. 4H trend aligned with trade direction
+#
+#  Signal grades:
+#  STRONG: level strength>=3 + volume>=1.3x + trend aligned
+#          → 2.0% risk, 1:8 RR
+#  NORMAL: passes all filters but not all strong criteria
+#          → 1.5% risk, 1:6 RR
+# ─────────────────────────────────────────────────────────────
+def detect_signal(c4h, c15m, c5m, sr):
+    if len(c15m) < 3 or len(c5m) < 2 or not sr:
         return None
 
-    last4h  = c4h[-1]
-    last1h  = c1h[-1]
-    last15m = c15m[-1] if c15m else None
-    px      = last15m["close"] if last15m else last1h["close"]
+    c15_curr = c15m[-1]
+    c15_prev = c15m[-2]
+    c5_curr  = c5m[-1]
 
-    # LONG
-    resistances = sorted(
-        [l for l in sr if l["type"] == "R" and l["price"] > px * 0.995],
-        key=lambda x: x["price"]
-    )
-    for res in resistances[:5]:
-        brk_1h = (last1h["close"] - res["price"]) / res["price"]
-        if MIN_BREAK_PCT < brk_1h < MAX_BREAK_PCT:
-            if last15m and last15m["close"] > res["price"] * 1.0005:
-                if last4h["close"] >= last4h["open"] * 0.999:
-                    entry = last15m["close"]
-                    sl    = min(res["price"] * 0.998, last15m["low"], last1h["low"])
-                    risk  = entry - sl
-                    if 0 < risk / entry < MAX_SL_PCT:
-                        return {
-                            "dir":       "LONG",
-                            "entry":     entry,
-                            "sl":        sl,
-                            "tp":        entry + risk * RR_RATIO,
-                            "level":     res["price"],
-                            "risk":      risk,
-                            "confirmed": True,
-                            "tf":        "4H+1H+15M",
-                        }
-            else:
-                return {"dir": "LONG", "confirmed": False, "level": res["price"]}
+    px       = c5_curr["close"]
+    trend    = get_4h_trend(c4h)
 
-    # SHORT
-    supports = sorted(
-        [l for l in sr if l["type"] == "S" and l["price"] < px * 1.005],
-        key=lambda x: -x["price"]
-    )
-    for sup in supports[:5]:
-        brk_1h = (sup["price"] - last1h["close"]) / sup["price"]
-        if MIN_BREAK_PCT < brk_1h < MAX_BREAK_PCT:
-            if last15m and last15m["close"] < sup["price"] * 0.9995:
-                if last4h["close"] <= last4h["open"] * 1.001:
-                    entry = last15m["close"]
-                    sl    = max(sup["price"] * 1.002, last15m["high"], last1h["high"])
-                    risk  = sl - entry
-                    if 0 < risk / entry < MAX_SL_PCT:
-                        return {
-                            "dir":       "SHORT",
-                            "entry":     entry,
-                            "sl":        sl,
-                            "tp":        entry - risk * RR_RATIO,
-                            "level":     sup["price"],
-                            "risk":      risk,
-                            "confirmed": True,
-                            "tf":        "4H+1H+15M",
-                        }
+    # Average volume last 20 candles
+    avg_vol  = (sum(c["volume"] for c in c15m[-20:]) / 20
+                if len(c15m) >= 20 else 0)
+    high_vol = (c15_curr["volume"] >= avg_vol * VOL_MULTIPLIER
+                if avg_vol > 0 else False)
+
+    def body_pct(c):
+        rng = c["high"] - c["low"]
+        return abs(c["close"] - c["open"]) / rng if rng > 0 else 0
+
+    def is_strong(strength):
+        return (strength >= STRONG_STRENGTH and high_vol and
+                trend in ("BULL", "BEAR"))
+
+    # ── LONG ─────────────────────────────────────────────────
+    # Only trade LONG if trend is BULL or NEUTRAL
+    if trend != "BEAR":
+        resistances = sorted(
+            [l for l in sr if l["type"] == "R" and l["price"] > px * 0.99],
+            key=lambda x: x["price"]
+        )
+        for res in resistances[:6]:
+            level = res["price"]
+            brk   = (c15_curr["close"] - level) / level
+
+            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT):
+                continue
+            if body_pct(c15_curr) < MIN_BODY_PCT:
+                continue  # weak candle — skip
+
+            if c5_curr["close"] > level * 1.0003:
+                entry  = c5_curr["close"]
+                sl     = min(level * 0.997, c15_curr["low"], c5_curr["low"])
+                risk   = entry - sl
+                if risk <= 0 or risk / entry > MAX_SL_PCT:
+                    continue
+
+                strong = is_strong(res["strength"])
+                rr     = RR_STRONG if strong else RR_NORMAL
+                rsk    = RISK_STRONG if strong else RISK_NORMAL
+
+                return {
+                    "dir":       "LONG",
+                    "entry":     entry,
+                    "sl":        sl,
+                    "tp":        entry + risk * rr,
+                    "level":     level,
+                    "risk":      risk,
+                    "rr":        rr,
+                    "risk_pct":  rsk,
+                    "confirmed": True,
+                    "strong":    strong,
+                    "tf":        "4H_SR+15M+5M",
+                    "strength":  res["strength"],
+                    "vol":       f"{c15_curr['volume']:.0f} "
+                                 f"({'HIGH' if high_vol else 'normal'})",
+                    "trend":     trend,
+                }
             else:
-                return {"dir": "SHORT", "confirmed": False, "level": sup["price"]}
+                return {
+                    "dir": "LONG", "confirmed": False,
+                    "level": level,
+                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
+                }
+
+    # ── SHORT ────────────────────────────────────────────────
+    # Only trade SHORT if trend is BEAR or NEUTRAL
+    if trend != "BULL":
+        supports = sorted(
+            [l for l in sr if l["type"] == "S" and l["price"] < px * 1.01],
+            key=lambda x: -x["price"]
+        )
+        for sup in supports[:6]:
+            level = sup["price"]
+            brk   = (level - c15_curr["close"]) / level
+
+            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT):
+                continue
+            if body_pct(c15_curr) < MIN_BODY_PCT:
+                continue
+
+            if c5_curr["close"] < level * 0.9997:
+                entry  = c5_curr["close"]
+                sl     = max(level * 1.003, c15_curr["high"], c5_curr["high"])
+                risk   = sl - entry
+                if risk <= 0 or risk / entry > MAX_SL_PCT:
+                    continue
+
+                strong = is_strong(sup["strength"])
+                rr     = RR_STRONG if strong else RR_NORMAL
+                rsk    = RISK_STRONG if strong else RISK_NORMAL
+
+                return {
+                    "dir":       "SHORT",
+                    "entry":     entry,
+                    "sl":        sl,
+                    "tp":        entry - risk * rr,
+                    "level":     level,
+                    "risk":      risk,
+                    "rr":        rr,
+                    "risk_pct":  rsk,
+                    "confirmed": True,
+                    "strong":    strong,
+                    "tf":        "4H_SR+15M+5M",
+                    "strength":  sup["strength"],
+                    "vol":       f"{c15_curr['volume']:.0f} "
+                                 f"({'HIGH' if high_vol else 'normal'})",
+                    "trend":     trend,
+                }
+            else:
+                return {
+                    "dir": "SHORT", "confirmed": False,
+                    "level": level,
+                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
+                }
 
     return None
 
 
 # ─────────────────────────────────────────────────────────────
-#  TRAILING STOP LOGIC
-#  Only activates after price moves 2x risk in your favor
-#  Trails at 40% of total move — not too tight
-#
-#  Example (LONG BTC):
-#   Entry = 71,628   Risk = 228
-#   Trail starts when price hits 72,084 (entry + 2×228)
-#   If price reaches 74,000:
-#     Total move = 74,000 - 71,628 = 2,372
-#     Trail SL   = 74,000 - (2,372 × 0.40) = 73,051
-#   Price must DROP 40% of the move to trigger SL
-#   Locks in 60% of profits automatically
+#  TRAILING STOP  (activates at 1.5x risk, trails at 35%)
 # ─────────────────────────────────────────────────────────────
-def calculate_trail_sl(sig, current_price):
-    """
-    Returns new SL price if trailing stop should be updated.
-    Returns None if not yet triggered or no update needed.
-    """
-    entry = sig["entry"]
-    risk  = sig["risk"]
-    orig_sl = sig["sl"]
-
-    if sig["dir"] == "LONG":
-        move = current_price - entry
-        # Only trail after 2x risk in profit
-        if move < risk * TRAIL_TRIGGER:
+def calculate_trail_sl(direction, entry, current_sl, orig_risk, px):
+    if direction == "LONG":
+        if px - entry < orig_risk * TRAIL_TRIGGER:
             return None
-        # New SL = current price minus 40% of total move
-        new_sl = current_price - (move * TRAIL_DISTANCE)
-        # Round to 2 decimal places
-        new_sl = round(new_sl, 2)
-        # Only update if new SL is higher than original SL
-        if new_sl > orig_sl:
-            return new_sl
-        return None
-
-    else:  # SHORT
-        move = entry - current_price
-        if move < risk * TRAIL_TRIGGER:
+        new_sl = round(px - (px - entry) * TRAIL_DISTANCE, 2)
+        return new_sl if new_sl > current_sl else None
+    else:
+        if entry - px < orig_risk * TRAIL_TRIGGER:
             return None
-        new_sl = current_price + (move * TRAIL_DISTANCE)
-        new_sl = round(new_sl, 2)
-        if new_sl < orig_sl:
-            return new_sl
-        return None
+        new_sl = round(px + (entry - px) * TRAIL_DISTANCE, 2)
+        return new_sl if new_sl < current_sl else None
 
 
-def update_stop_loss(product_id, order_id, new_sl_price, direction):
-    """Update existing stop loss order to new price."""
-    try:
-        payload = {
-            "id":         order_id,
-            "stop_price": str(new_sl_price),
-        }
-        api_put(f"/v2/orders/{order_id}", payload)
-        log.info(f"  Trailing SL updated to {new_sl_price}")
-        return True
-    except Exception as e:
-        log.warning(f"  Could not update SL: {e}")
-        return False
+def manage_open_positions(open_positions, c5m_by_asset):
+    if not open_positions:
+        return
+    log.info(f"\n  Managing {len(open_positions)} open position(s)...")
+
+    for pid, pos in open_positions.items():
+        try:
+            size   = float(pos.get("size", 0) or 0)
+            if not size: continue
+            symbol = pos.get("product_symbol", "")
+            entry  = float(pos.get("entry_price", 0) or 0)
+            dir_   = "LONG" if size > 0 else "SHORT"
+            asset  = "BTC" if "BTC" in symbol else "ETH"
+            c5m    = c5m_by_asset.get(asset, [])
+            if not c5m: continue
+
+            px  = c5m[-1]["close"]
+            dp  = 1 if entry > 1000 else 2
+            pnl = px - entry if dir_ == "LONG" else entry - px
+            log.info(f"  {asset} {dir_} | Entry={entry:.{dp}f} | "
+                     f"Now={px:.{dp}f} | P/L={pnl:+.{dp}f}")
+
+            sl_orders = [o for o in get_open_orders(pid)
+                         if o.get("order_type") == "stop_market_order"]
+            if not sl_orders:
+                log.info(f"    No SL order found.")
+                continue
+
+            sl_ord     = sl_orders[0]
+            current_sl = float(sl_ord.get("stop_price", 0) or 0)
+            orig_risk  = abs(entry - current_sl)
+            if not orig_risk: continue
+
+            new_sl = calculate_trail_sl(dir_, entry, current_sl, orig_risk, px)
+            if new_sl:
+                log.info(f"    Trail: {current_sl:.{dp}f} → {new_sl:.{dp}f} ✅")
+                try:
+                    api_put(f"/v2/orders/{sl_ord['id']}",
+                            {"id": sl_ord["id"], "stop_price": str(new_sl)})
+                except Exception as e:
+                    log.warning(f"    SL update failed: {e}")
+            else:
+                trig = (entry + orig_risk * TRAIL_TRIGGER if dir_ == "LONG"
+                        else entry - orig_risk * TRAIL_TRIGGER)
+                log.info(f"    Trail activates at {trig:.{dp}f} "
+                         f"(need {abs(trig-px):.{dp}f} more pts)")
+        except Exception as e:
+            log.warning(f"  Manage error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-#  ORDER EXECUTION
-#  Method 1: Bracket order (entry + SL + TP together)
-#  Method 2: Fallback — separate entry, SL, TP orders
+#  ORDER PLACEMENT
 # ─────────────────────────────────────────────────────────────
-def place_order_with_sl_tp(product_id, sig, qty, symbol):
+def place_order(product_id, sig, qty, symbol):
     side     = "buy"  if sig["dir"] == "LONG"  else "sell"
     close    = "sell" if sig["dir"] == "LONG"  else "buy"
     sl_price = round(sig["sl"], 2)
     tp_price = round(sig["tp"], 2)
     dp       = 1 if sig["entry"] > 1000 else 2
+    sl_off   = -0.5 if sig["dir"] == "LONG" else 0.5
+    tp_off   =  0.5 if sig["dir"] == "LONG" else -0.5
 
     if DRY_RUN:
-        log.info(f"  [DRY RUN] {symbol} {sig['dir']} simulated.")
-        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price}")
-        log.info(f"  Trail starts after {sig['risk']*TRAIL_TRIGGER:.{dp}f} points profit")
+        log.info(f"  [DRY RUN] {symbol} {sig['dir']} | "
+                 f"Entry={sig['entry']:.{dp}f} | SL={sl_price} | "
+                 f"TP={tp_price} | RR=1:{int(sig['rr'])}")
         return True
 
-    sl_off = -0.5 if sig["dir"] == "LONG" else 0.5
-    tp_off =  0.5 if sig["dir"] == "LONG" else -0.5
-
-    # Method 1 — Bracket order
+    # Method 1: Bracket order
     try:
-        bracket_payload = {
+        r = api_post("/v2/orders", {
             "product_id":                      product_id,
             "size":                            qty,
             "side":                            side,
@@ -377,138 +475,43 @@ def place_order_with_sl_tp(product_id, sig, qty, symbol):
             "bracket_stop_loss_limit_price":   str(sl_price),
             "bracket_take_profit_price":       str(round(tp_price + tp_off, 2)),
             "bracket_take_profit_limit_price": str(tp_price),
-        }
-        resp   = api_post("/v2/orders", bracket_payload)
-        result = resp.get("result", {})
-        log.info(f"  Bracket order placed! ID={result.get('id','?')}")
-        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price} | RR=1:{int(RR_RATIO)}")
-        log.info(f"  Trail activates after +{sig['risk']*TRAIL_TRIGGER:.{dp}f} points")
+        })
+        res = r.get("result", {})
+        log.info(f"  Bracket OK! ID={res.get('id','?')}")
+        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | "
+                 f"TP={tp_price} | RR=1:{int(sig['rr'])}")
         return True
-    except requests.HTTPError as e:
+    except requests.HTTPError:
         log.warning(f"  Bracket failed — trying fallback...")
 
-    # Method 2 — Fallback: separate orders
+    # Method 2: Fallback
     try:
-        entry_resp = api_post("/v2/orders", {
-            "product_id":    product_id,
-            "size":          qty,
-            "side":          side,
-            "order_type":    "market_order",
+        er = api_post("/v2/orders", {
+            "product_id": product_id, "size": qty,
+            "side": side, "order_type": "market_order",
             "time_in_force": "gtc",
         })
-        log.info(f"  Entry placed! ID={entry_resp.get('result',{}).get('id','?')}")
+        log.info(f"  Entry OK! ID={er.get('result',{}).get('id','?')}")
         time.sleep(2)
-
         api_post("/v2/orders", {
-            "product_id":       product_id,
-            "size":             qty,
-            "side":             close,
-            "order_type":       "stop_market_order",
-            "time_in_force":    "gtc",
-            "stop_price":       str(sl_price),
-            "close_on_trigger": True,
+            "product_id": product_id, "size": qty, "side": close,
+            "order_type": "stop_market_order", "time_in_force": "gtc",
+            "stop_price": str(sl_price), "close_on_trigger": True,
         })
         log.info(f"  SL set at {sl_price}")
-
         api_post("/v2/orders", {
-            "product_id":       product_id,
-            "size":             qty,
-            "side":             close,
-            "order_type":       "take_profit_market_order",
-            "time_in_force":    "gtc",
-            "stop_price":       str(tp_price),
-            "close_on_trigger": True,
+            "product_id": product_id, "size": qty, "side": close,
+            "order_type": "take_profit_market_order", "time_in_force": "gtc",
+            "stop_price": str(tp_price), "close_on_trigger": True,
         })
         log.info(f"  TP set at {tp_price}")
-        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price} | RR=1:{int(RR_RATIO)}")
-        log.info(f"  Trail activates after +{sig['risk']*TRAIL_TRIGGER:.{dp}f} points")
+        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | "
+                 f"TP={tp_price} | RR=1:{int(sig['rr'])}")
         return True
-
     except Exception as e:
         log.error(f"  All methods failed: {e}")
-        log.error(f"  SET MANUALLY: SL={sl_price} TP={tp_price}")
+        log.error(f"  SET MANUALLY → SL={sl_price}  TP={tp_price}")
         return False
-
-
-# ─────────────────────────────────────────────────────────────
-#  MANAGE OPEN POSITIONS (trailing stop)
-# ─────────────────────────────────────────────────────────────
-def manage_open_positions(open_positions, c15m_by_asset):
-    """
-    Check all open positions and update trailing stops if needed.
-    Runs every 15 minutes automatically.
-    """
-    if not open_positions:
-        return
-
-    log.info(f"\n  Managing {len(open_positions)} open position(s)...")
-
-    for pid, pos in open_positions.items():
-        try:
-            size = float(pos.get("size", 0) or 0)
-            if size == 0:
-                continue
-
-            symbol    = pos.get("product_symbol", "")
-            entry     = float(pos.get("entry_price", 0) or 0)
-            direction = "LONG" if size > 0 else "SHORT"
-
-            # Get current price from 15M candles
-            asset  = "BTC" if "BTC" in symbol else "ETH"
-            c15m   = c15m_by_asset.get(asset, [])
-            if not c15m:
-                continue
-            current_price = c15m[-1]["close"]
-
-            # Calculate current profit
-            if direction == "LONG":
-                profit_pts = current_price - entry
-            else:
-                profit_pts = entry - current_price
-
-            dp = 1 if entry > 1000 else 2
-            log.info(f"  {asset} {direction} | Entry={entry:.{dp}f} | "
-                     f"Now={current_price:.{dp}f} | P/L={profit_pts:+.{dp}f}")
-
-            # Reconstruct sig dict for trailing calculation
-            # Get original SL from open orders
-            orders    = get_open_orders(pid)
-            sl_orders = [o for o in orders if o.get("order_type") == "stop_market_order"]
-
-            if not sl_orders:
-                log.info(f"    No SL order found — skipping trail")
-                continue
-
-            sl_order    = sl_orders[0]
-            current_sl  = float(sl_order.get("stop_price", 0) or 0)
-            orig_risk   = abs(entry - current_sl)
-
-            if orig_risk <= 0:
-                continue
-
-            sig_mock = {
-                "dir":    direction,
-                "entry":  entry,
-                "sl":     current_sl,
-                "risk":   orig_risk,
-            }
-
-            new_sl = calculate_trail_sl(sig_mock, current_price)
-
-            if new_sl and new_sl != current_sl:
-                log.info(f"    Trailing SL: {current_sl:.{dp}f} → {new_sl:.{dp}f}")
-                update_stop_loss(pid, sl_order["id"], new_sl, direction)
-            else:
-                trail_trigger_price = (
-                    entry + orig_risk * TRAIL_TRIGGER
-                    if direction == "LONG"
-                    else entry - orig_risk * TRAIL_TRIGGER
-                )
-                remaining = abs(trail_trigger_price - current_price)
-                log.info(f"    Trail not yet active. Need {remaining:.{dp}f} more points.")
-
-        except Exception as e:
-            log.warning(f"  Position management error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -516,9 +519,12 @@ def manage_open_positions(open_positions, c15m_by_asset):
 # ─────────────────────────────────────────────────────────────
 def run():
     log.info("=" * 65)
-    log.info(f"Delta Algo v4 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | Risk={RISK_PERCENT}% | "
-             f"RR=1:{int(RR_RATIO)} | Trail@{int(TRAIL_DISTANCE*100)}% | 4H+1H+15M")
+    log.info(f"Delta Pro v7 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | "
+             f"Risk={RISK_NORMAL}-{RISK_STRONG}% | "
+             f"RR=1:{int(RR_NORMAL)}/1:{int(RR_STRONG)} | "
+             f"Trail@{int(TRAIL_DISTANCE*100)}% | "
+             f"4H_SR+15M+5M+VOL+TREND")
     log.info("=" * 65)
 
     if not API_KEY or not API_SECRET:
@@ -543,7 +549,7 @@ def run():
         raw_bal = get_wallet_balance()
         if raw_bal == -1.0:
             balance = 5000.0
-            log.info(f"  Geo-block bypass — fallback Rs.{balance:,.0f}")
+            log.info(f"  Geo-block bypass — Rs.{balance:,.0f}")
         elif raw_bal < 700:
             log.warning(f"  Balance too low. Add funds.")
             return
@@ -551,29 +557,25 @@ def run():
             balance = raw_bal
             log.info(f"  Live balance: Rs.{balance:,.0f}")
 
-    # Step 3 — Fetch candles for all assets first
-    c15m_by_asset = {}
-    c4h_by_asset  = {}
-    c1h_by_asset  = {}
-
+    # Step 3 — Fetch candles
+    c4h_by  = {}
+    c15m_by = {}
+    c5m_by  = {}
     for asset, cfg in ASSETS.items():
         try:
-            c4h  = get_candles(cfg["symbol"], 240, 120)
-            c1h  = get_candles(cfg["symbol"], 60,  100)
-            c15m = get_candles(cfg["symbol"], 15,  96)
-            c4h_by_asset[asset]  = c4h
-            c1h_by_asset[asset]  = c1h
-            c15m_by_asset[asset] = c15m
+            c4h_by[asset]  = get_candles(cfg["symbol"], 240, 120)
+            c15m_by[asset] = get_candles(cfg["symbol"], 15,  100)
+            c5m_by[asset]  = get_candles(cfg["symbol"], 5,   100)
         except Exception as e:
-            log.error(f"  Candle fetch failed for {asset}: {e}")
+            log.error(f"  Candle error {asset}: {e}")
 
     # Step 4 — Manage open positions (trailing stop)
     if not DRY_RUN:
-        open_positions = get_open_positions()
-        if open_positions:
-            manage_open_positions(open_positions, c15m_by_asset)
+        open_pos = get_open_positions()
+        if open_pos:
+            manage_open_positions(open_pos, c5m_by)
 
-    # Step 5 — Look for new signals
+    # Step 5 — Scan for new signals
     trades_placed = 0
     total_risk    = 0.0
 
@@ -582,73 +584,80 @@ def run():
         log.info(f"Analysing {asset} ({cfg['symbol']})")
         log.info(f"{'─'*50}")
 
-        if total_risk >= balance * 0.04:
-            log.info("  Max risk reached. Stopping.")
+        if total_risk >= balance * MAX_TOTAL_RISK / 100:
+            log.info("  Max total risk reached. Stopping.")
             break
 
         pid = cfg.get("product_id")
         if not pid:
             continue
 
-        # Skip if already in position
         if not DRY_RUN:
-            open_positions = get_open_positions()
-            if pid in open_positions:
-                log.info(f"  Open position exists — trailing stop active.")
+            op = get_open_positions()
+            if pid in op:
+                log.info(f"  Position open — trailing active.")
                 continue
 
-        c4h  = c4h_by_asset.get(asset,  [])
-        c1h  = c1h_by_asset.get(asset,  [])
-        c15m = c15m_by_asset.get(asset, [])
+        c4h  = c4h_by.get(asset,  [])
+        c15m = c15m_by.get(asset, [])
+        c5m  = c5m_by.get(asset,  [])
 
-        if not c4h or not c1h:
+        if not c4h or not c15m or not c5m:
             continue
 
-        px = c15m[-1]["close"] if c15m else c1h[-1]["close"]
-        log.info(f"  Price: {px:,.2f}")
-        log.info(f"  Candles: {len(c4h)}x4H | {len(c1h)}x1H | {len(c15m)}x15M")
+        px    = c5m[-1]["close"]
+        trend = get_4h_trend(c4h)
+        dp    = 1 if px > 1000 else 2
 
-        # S/R from 4H
+        log.info(f"  Price : {px:,.2f}")
+        log.info(f"  4H Trend : {trend}")
+        log.info(f"  Candles: {len(c4h)}x4H | {len(c15m)}x15M | {len(c5m)}x5M")
+
         sr = detect_sr_levels(c4h)
         log.info(f"  4H S/R: {len(sr)} levels")
-        for lv in sr[:5]:
+        for lv in sr[:6]:
             dist = (lv['price'] - px) / px * 100
+            tag  = " ← STRONG" if lv["strength"] >= STRONG_STRENGTH else ""
             log.info(f"    {lv['type']} {lv['price']:,.2f} "
-                     f"(str={lv['strength']}) {dist:+.2f}%")
+                     f"(str={lv['strength']}) {dist:+.2f}%{tag}")
 
-        # Signal
-        sig = detect_signal(c4h, c1h, c15m, sr)
+        sig = detect_signal(c4h, c15m, c5m, sr)
 
         if not sig:
-            log.info(f"  No signal.")
+            log.info(f"  No signal — not near any 4H level.")
             continue
 
         if not sig["confirmed"]:
-            log.info(f"  {sig['dir']} at {sig['level']:,.2f} — waiting 15M.")
+            log.info(f"  {sig['dir']} near {sig['level']:,.2f} — "
+                     f"{sig.get('msg','waiting 5M candle')}")
             continue
 
-        # Position sizing
-        dp          = 1 if sig["entry"] > 1000 else 2
-        risk_budget = balance * RISK_PERCENT / 100
+        # Confirmed signal
+        grade      = "STRONG ⚡" if sig["strong"] else "NORMAL"
+        risk_pct   = sig["risk_pct"]
+        rr         = sig["rr"]
+        risk_budget = balance * risk_pct / 100
         risk_per_c  = abs(sig["entry"] - sig["sl"])
         qty         = max(1, int(risk_budget / risk_per_c)) if risk_per_c > 0 else 1
         actual_risk = qty * risk_per_c
         actual_tp   = qty * abs(sig["tp"] - sig["entry"])
 
-        log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{sig['tf']}] ***")
+        log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{grade}] ***")
+        log.info(f"  Timeframe  : {sig['tf']}")
+        log.info(f"  4H Level   : {sig['level']:,.{dp}f} (strength={sig['strength']})")
+        log.info(f"  4H Trend   : {sig['trend']}")
+        log.info(f"  Volume     : {sig['vol']}")
         log.info(f"  Entry      : {sig['entry']:,.{dp}f}")
         log.info(f"  Stop Loss  : {sig['sl']:,.{dp}f}")
-        log.info(f"  Take Profit: {sig['tp']:,.{dp}f}  (1:{int(RR_RATIO)} RR)")
-        log.info(f"  Trail SL   : activates after +"
-                 f"{sig['risk']*TRAIL_TRIGGER:.{dp}f} points profit")
-        log.info(f"  Trail dist : {int(TRAIL_DISTANCE*100)}% of move"
-                 f" (not too tight)")
-        log.info(f"  Risk       : Rs.{actual_risk:.0f} "
-                 f"({actual_risk/balance*100:.2f}%)")
+        log.info(f"  Take Profit: {sig['tp']:,.{dp}f}  (1:{int(rr)} RR)")
+        log.info(f"  Risk       : Rs.{actual_risk:.0f}  ({risk_pct}% of balance)")
         log.info(f"  Reward     : Rs.{actual_tp:.0f}")
         log.info(f"  Contracts  : {qty}")
+        log.info(f"  Trail SL   : starts after "
+                 f"+{risk_per_c * TRAIL_TRIGGER:.{dp}f} pts "
+                 f"| trails at {int(TRAIL_DISTANCE*100)}%")
 
-        success = place_order_with_sl_tp(pid, sig, qty, asset)
+        success = place_order(pid, sig, qty, asset)
         if success:
             trades_placed += 1
             total_risk    += actual_risk
