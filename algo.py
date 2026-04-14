@@ -1,10 +1,13 @@
 """
-Delta Exchange India â€” BTC + ETH S/R Breakout Algo
-===================================================
-Strategy : 1H S/R detection -> 15M confirmation -> Bracket order (SL + TP 1:4)
-Exchange : Delta Exchange India  (api.india.delta.exchange)
-Assets   : BTCUSD + ETHUSD  (both traded simultaneously)
-Risk     : 1.5% per trade   (increased from 1% for more profit)
+Delta Exchange India â€” BTC + ETH Multi-Timeframe Breakout Algo v3
+=================================================================
+Strategy : 4H S/R detection -> 1H confirm -> 15M entry
+           Bracket order with SL + TP 1:4
+           Fallback: separate SL/TP orders if bracket fails
+Exchange : Delta Exchange India
+Assets   : BTCUSD + ETHUSD
+Risk     : 1.5% per trade
+Runs     : Every 15 minutes via GitHub Actions
 """
 
 import os, time, hmac, hashlib, json, requests, logging
@@ -17,20 +20,18 @@ API_KEY    = os.environ.get("DELTA_API_KEY",    "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 BASE_URL   = "https://api.india.delta.exchange"
 
-# Both BTC and ETH now traded
 ASSETS = {
     "BTC": {"symbol": "BTCUSD", "product_id": None},
     "ETH": {"symbol": "ETHUSD", "product_id": None},
 }
 
-RISK_PERCENT   = 1.5    # increased from 1.0 â†’ more profit, still safe
-RR_RATIO       = 4.0    # take profit = risk Ã— 4  (1:4 RR)
-MIN_BREAK_PCT  = 0.001
-MAX_BREAK_PCT  = 0.03
+RISK_PERCENT   = 1.5
+RR_RATIO       = 4.0
 SR_LOOKBACK    = 5
 SR_CLUSTER_TOL = 0.003
-MAX_SL_PCT     = 0.05
-MAX_TRADES_PER_RUN = 2  # allow both BTC and ETH to trade same run
+MIN_BREAK_PCT  = 0.001
+MAX_BREAK_PCT  = 0.04
+MAX_SL_PCT     = 0.06
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
@@ -39,11 +40,11 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("delta_algo")
+log = logging.getLogger("delta_algo_v3")
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  AUTH HELPERS
+#  AUTH
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def auth_headers(method, path, query_string="", body=""):
     timestamp = str(int(time.time()))
@@ -64,7 +65,6 @@ def auth_headers(method, path, query_string="", body=""):
         "Accept":       "application/json",
     }
 
-
 def api_get(path, params=None):
     qs  = "&".join(f"{k}={v}" for k, v in (params or {}).items())
     url = BASE_URL + path + ("?" + qs if qs else "")
@@ -72,10 +72,14 @@ def api_get(path, params=None):
     r.raise_for_status()
     return r.json()
 
-
 def api_post(path, payload):
     body = json.dumps(payload, separators=(",", ":"))
-    r    = requests.post(BASE_URL + path, headers=auth_headers("POST", path, "", body), data=body, timeout=15)
+    r    = requests.post(
+        BASE_URL + path,
+        headers=auth_headers("POST", path, "", body),
+        data=body,
+        timeout=15
+    )
     r.raise_for_status()
     return r.json()
 
@@ -96,16 +100,17 @@ def get_product_id(symbol):
     return None
 
 
-def get_candles(symbol, resolution, limit=110):
+def get_candles(symbol, resolution, limit=150):
     end     = int(time.time())
     start   = end - resolution * 60 * limit
-    res_str = {60: "1h", 15: "15m", 5: "5m", 1: "1m"}.get(resolution, str(resolution))
+    res_map = {240: "4h", 60: "1h", 15: "15m", 5: "5m", 1: "1m"}
+    res_str = res_map.get(resolution, str(resolution))
     url     = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution={res_str}&start={start}&end={end}"
     r       = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
     r.raise_for_status()
     raw = r.json().get("result", [])
     if not raw:
-        raise ValueError(f"No candles returned for {symbol} res={res_str}")
+        raise ValueError(f"No candles for {symbol} {res_str}")
     candles = []
     for c in raw:
         try:
@@ -123,27 +128,17 @@ def get_candles(symbol, resolution, limit=110):
 
 
 def get_wallet_balance():
-    """
-    Try to fetch real balance.
-    If Delta India API blocks the request (geo-block from GitHub USA servers)
-    fall back to a safe default so algo can still run and place orders.
-    Exchange will reject orders automatically if real margin is insufficient.
-    """
     try:
         data = api_get("/v2/wallet/balances")
-        balances = data.get("result", [])
-        for b in balances:
+        for b in data.get("result", []):
             val = float(b.get("available_balance", 0) or 0)
             if val > 0:
                 log.info(f"  Asset: {b.get('asset_symbol')}  Balance: {val:.2f}")
                 return val
-        log.warning("  All balances are zero on exchange.")
         return 0.0
     except Exception as e:
-        log.warning(f"  Could not fetch balance ({e})")
-        log.warning(f"  This is likely a geo-block (GitHub USA -> Delta India)")
-        log.warning(f"  Using fallback balance for position sizing.")
-        return -1.0   # special value meaning: use fallback
+        log.warning(f"  Balance fetch failed ({e}) â€” using fallback")
+        return -1.0
 
 
 def get_open_position(product_id):
@@ -159,7 +154,7 @@ def get_open_position(product_id):
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  S/R DETECTION
+#  S/R DETECTION  (4H candles = stronger zones)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def detect_sr_levels(candles):
     raw, n, lb = [], len(candles), SR_LOOKBACK
@@ -177,59 +172,97 @@ def detect_sr_levels(candles):
         for j, b in enumerate(raw):
             if j not in used and abs(b["price"] - a["price"]) / a["price"] < SR_CLUSTER_TOL:
                 cluster.append(b["price"]); used.add(j)
-        out.append({"price": sum(cluster)/len(cluster), "type": a["type"], "strength": len(cluster)})
-    return sorted(out, key=lambda x: -x["strength"])[:10]
+        out.append({
+            "price":    sum(cluster) / len(cluster),
+            "type":     a["type"],
+            "strength": len(cluster),
+        })
+    return sorted(out, key=lambda x: -x["strength"])[:12]
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  SIGNAL DETECTION
+#  SIGNAL DETECTION  (4H + 1H + 15M confirmation)
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def detect_signal(c1h, c15m, sr):
-    if len(c1h) < 12 or not sr:
+def detect_signal(c4h, c1h, c15m, sr):
+    if len(c4h) < 10 or len(c1h) < 10 or not sr:
         return None
+
+    last4h  = c4h[-1]
     last1h  = c1h[-1]
     last15m = c15m[-1] if c15m else None
     px      = last15m["close"] if last15m else last1h["close"]
 
     # LONG
-    for res in sorted([l for l in sr if l["type"]=="R" and l["price"]>px*0.997], key=lambda x: x["price"])[:4]:
-        brk = (last1h["close"] - res["price"]) / res["price"]
-        if MIN_BREAK_PCT < brk < MAX_BREAK_PCT:
-            if last15m and last15m["close"] > res["price"] * 1.001:
-                entry = last15m["close"]
-                sl    = min(res["price"] * 0.999, last15m["low"])
-                risk  = entry - sl
-                if 0 < risk / entry < MAX_SL_PCT:
-                    return {"dir":"LONG","entry":entry,"sl":sl,"tp":entry+risk*RR_RATIO,"level":res["price"],"risk":risk,"confirmed":True}
+    resistances = sorted(
+        [l for l in sr if l["type"] == "R" and l["price"] > px * 0.995],
+        key=lambda x: x["price"]
+    )
+    for res in resistances[:5]:
+        brk_1h = (last1h["close"] - res["price"]) / res["price"]
+        if MIN_BREAK_PCT < brk_1h < MAX_BREAK_PCT:
+            if last15m and last15m["close"] > res["price"] * 1.0005:
+                if last4h["close"] >= last4h["open"] * 0.999:
+                    entry = last15m["close"]
+                    sl    = min(res["price"] * 0.998, last15m["low"], last1h["low"])
+                    risk  = entry - sl
+                    if 0 < risk / entry < MAX_SL_PCT:
+                        return {
+                            "dir": "LONG", "entry": entry, "sl": sl,
+                            "tp": entry + risk * RR_RATIO,
+                            "level": res["price"], "risk": risk,
+                            "confirmed": True, "tf": "4H+1H+15M",
+                        }
             else:
-                return {"dir":"LONG","confirmed":False,"level":res["price"]}
+                return {"dir": "LONG", "confirmed": False, "level": res["price"]}
 
     # SHORT
-    for sup in sorted([l for l in sr if l["type"]=="S" and l["price"]<px*1.003], key=lambda x: -x["price"])[:4]:
-        brk = (sup["price"] - last1h["close"]) / sup["price"]
-        if MIN_BREAK_PCT < brk < MAX_BREAK_PCT:
-            if last15m and last15m["close"] < sup["price"] * 0.999:
-                entry = last15m["close"]
-                sl    = max(sup["price"] * 1.001, last15m["high"])
-                risk  = sl - entry
-                if 0 < risk / entry < MAX_SL_PCT:
-                    return {"dir":"SHORT","entry":entry,"sl":sl,"tp":entry-risk*RR_RATIO,"level":sup["price"],"risk":risk,"confirmed":True}
+    supports = sorted(
+        [l for l in sr if l["type"] == "S" and l["price"] < px * 1.005],
+        key=lambda x: -x["price"]
+    )
+    for sup in supports[:5]:
+        brk_1h = (sup["price"] - last1h["close"]) / sup["price"]
+        if MIN_BREAK_PCT < brk_1h < MAX_BREAK_PCT:
+            if last15m and last15m["close"] < sup["price"] * 0.9995:
+                if last4h["close"] <= last4h["open"] * 1.001:
+                    entry = last15m["close"]
+                    sl    = max(sup["price"] * 1.002, last15m["high"], last1h["high"])
+                    risk  = sl - entry
+                    if 0 < risk / entry < MAX_SL_PCT:
+                        return {
+                            "dir": "SHORT", "entry": entry, "sl": sl,
+                            "tp": entry - risk * RR_RATIO,
+                            "level": sup["price"], "risk": risk,
+                            "confirmed": True, "tf": "4H+1H+15M",
+                        }
             else:
-                return {"dir":"SHORT","confirmed":False,"level":sup["price"]}
+                return {"dir": "SHORT", "confirmed": False, "level": sup["price"]}
+
     return None
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  ORDER
+#  ORDER EXECUTION
+#  Method 1: Bracket order (entry + SL + TP in one)
+#  Method 2: Fallback â€” place entry first, then SL/TP separately
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def place_bracket_order(product_id, sig, qty, symbol):
-    side     = "buy" if sig["dir"] == "LONG" else "sell"
+def place_order_with_sl_tp(product_id, sig, qty, symbol):
+    side     = "buy"  if sig["dir"] == "LONG"  else "sell"
+    close    = "sell" if sig["dir"] == "LONG"  else "buy"
     sl_price = round(sig["sl"], 2)
     tp_price = round(sig["tp"], 2)
-    sl_off   = -0.5 if sig["dir"] == "LONG" else 0.5
-    tp_off   =  0.5 if sig["dir"] == "LONG" else -0.5
+    dp       = 1 if sig["entry"] > 1000 else 2
 
-    payload = {
+    if DRY_RUN:
+        log.info(f"  [DRY RUN] {symbol} {sig['dir']} order simulated.")
+        log.info(f"  Entry={sig['entry']:.{dp}f} SL={sl_price} TP={tp_price}")
+        return True
+
+    # â”€â”€ Method 1: Bracket order â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    sl_off = -0.5 if sig["dir"] == "LONG" else 0.5
+    tp_off =  0.5 if sig["dir"] == "LONG" else -0.5
+
+    bracket_payload = {
         "product_id":                      product_id,
         "size":                            qty,
         "side":                            side,
@@ -240,13 +273,71 @@ def place_bracket_order(product_id, sig, qty, symbol):
         "bracket_take_profit_price":       str(round(tp_price + tp_off, 2)),
         "bracket_take_profit_limit_price": str(tp_price),
     }
-    log.info(f"  Payload: {json.dumps(payload)}")
 
-    if DRY_RUN:
-        log.info(f"  [DRY RUN] {symbol} order simulated â€” NOT sent to exchange.")
-        return {"result": {"id": f"DRY_RUN_{symbol}", "state": "simulated"}}
+    try:
+        resp   = api_post("/v2/orders", bracket_payload)
+        result = resp.get("result", {})
+        log.info(f"  âœ… Bracket order placed! ID={result.get('id','?')} state={result.get('state','?')}")
+        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price} | RR=1:{int(RR_RATIO)}")
+        return True
+    except requests.HTTPError as e:
+        err = e.response.text if e.response else str(e)
+        log.warning(f"  Bracket order failed: {err}")
+        log.info(f"  Trying fallback method...")
 
-    return api_post("/v2/orders", payload)
+    # â”€â”€ Method 2: Fallback â€” market entry + separate SL/TP â”€â”€â”€
+    try:
+        # Step A: Place market entry order
+        entry_payload = {
+            "product_id":   product_id,
+            "size":         qty,
+            "side":         side,
+            "order_type":   "market_order",
+            "time_in_force": "gtc",
+        }
+        entry_resp = api_post("/v2/orders", entry_payload)
+        entry_result = entry_resp.get("result", {})
+        log.info(f"  âœ… Entry order placed! ID={entry_result.get('id','?')}")
+
+        # Wait 2 seconds for order to fill
+        time.sleep(2)
+
+        # Step B: Place Stop Loss order
+        sl_payload = {
+            "product_id":   product_id,
+            "size":         qty,
+            "side":         close,
+            "order_type":   "stop_market_order",
+            "time_in_force": "gtc",
+            "stop_price":   str(sl_price),
+            "close_on_trigger": True,
+        }
+        sl_resp = api_post("/v2/orders", sl_payload)
+        log.info(f"  âœ… Stop Loss set at {sl_price}")
+
+        # Step C: Place Take Profit order
+        tp_payload = {
+            "product_id":   product_id,
+            "size":         qty,
+            "side":         close,
+            "order_type":   "take_profit_market_order",
+            "time_in_force": "gtc",
+            "stop_price":   str(tp_price),
+            "close_on_trigger": True,
+        }
+        tp_resp = api_post("/v2/orders", tp_payload)
+        log.info(f"  âœ… Take Profit set at {tp_price}")
+        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price} | RR=1:{int(RR_RATIO)}")
+        return True
+
+    except requests.HTTPError as e:
+        err = e.response.text if e.response else str(e)
+        log.error(f"  âŒ Fallback also failed: {err}")
+        log.error(f"  âš ï¸  MANUAL ACTION NEEDED: Set SL={sl_price} TP={tp_price} on Delta Exchange app!")
+        return False
+    except Exception as e:
+        log.error(f"  âŒ Unexpected error: {e}")
+        return False
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -254,15 +345,15 @@ def place_bracket_order(product_id, sig, qty, symbol):
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def run():
     log.info("=" * 65)
-    log.info(f"Delta Exchange India Algo | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    log.info(f"DRY_RUN = {DRY_RUN}  |  Assets: BTC + ETH  |  Risk: {RISK_PERCENT}%  |  RR: 1:{int(RR_RATIO)}")
+    log.info(f"Delta Algo v3 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | Risk={RISK_PERCENT}% | RR=1:{int(RR_RATIO)} | 4H+1H+15M")
     log.info("=" * 65)
 
     if not API_KEY or not API_SECRET:
-        log.error("API keys not set. Add DELTA_API_KEY and DELTA_API_SECRET to GitHub Secrets.")
+        log.error("API keys not set. Add to GitHub Secrets.")
         return
 
-    # Step 1: Resolve product IDs
+    # Step 1 â€” Product IDs
     log.info("Resolving product IDs...")
     for asset, cfg in ASSETS.items():
         pid = get_product_id(cfg["symbol"])
@@ -270,30 +361,25 @@ def run():
             cfg["product_id"] = pid
             log.info(f"  {asset}: {cfg['symbol']} -> product_id={pid}")
         else:
-            log.warning(f"  {asset}: {cfg['symbol']} not found")
+            log.warning(f"  {asset}: not found")
 
-    # Step 2: Balance
+    # Step 2 â€” Balance
     if DRY_RUN:
         balance = 25000.0
         log.info(f"[DRY RUN] Mock balance = â‚¹{balance:,.0f}")
     else:
-        raw_balance = get_wallet_balance()
-
-        if raw_balance == -1.0:
-            # Geo-block: GitHub (USA) cannot reach Delta India API
-            # Use conservative fallback â€” exchange rejects if real margin insufficient
+        raw_bal = get_wallet_balance()
+        if raw_bal == -1.0:
             balance = 5000.0
-            log.info(f"  Fallback balance â‚¹{balance:,.0f} (geo-block bypass)")
-            log.info(f"  Exchange will auto-reject order if real margin is insufficient.")
-        elif raw_balance < 700:
-            log.warning(f"  Balance â‚¹{raw_balance:.0f} too low â€” need at least â‚¹700 for 1 contract.")
-            log.warning(f"  Add funds to Delta Exchange to continue.")
+            log.info(f"  Geo-block bypass â€” fallback â‚¹{balance:,.0f}")
+        elif raw_bal < 700:
+            log.warning(f"  Balance â‚¹{raw_bal:.0f} too low. Add funds.")
             return
         else:
-            balance = raw_balance
+            balance = raw_bal
             log.info(f"  Live balance: â‚¹{balance:,.0f} âœ…")
 
-    # Step 3: Analyse each asset â€” BOTH can trade in same run
+    # Step 3 â€” Analyse assets
     trades_placed = 0
     total_risk    = 0.0
 
@@ -302,88 +388,75 @@ def run():
         log.info(f"Analysing {asset} ({cfg['symbol']})")
         log.info(f"{'â”€'*50}")
 
-        # Safety: stop if already risked 3% total this run (1.5% Ã— 2 assets)
-        if total_risk >= balance * 0.03:
-            log.info(f"  Max total risk reached for this run. Stopping.")
+        if total_risk >= balance * 0.04:
+            log.info("  Max risk reached. Stopping.")
             break
 
         pid = cfg.get("product_id")
         if not pid:
-            log.warning(f"  Skipping {asset} â€” product_id not found.")
+            log.warning(f"  No product_id. Skipping.")
             continue
 
-        # Check existing position
         if not DRY_RUN:
             pos = get_open_position(pid)
             if pos:
-                log.info(f"  Already in position (size={pos.get('size')}). Skipping.")
+                log.info(f"  Open position exists. Skipping.")
                 continue
 
-        # Fetch candles
+        # Fetch 3 timeframes
         try:
+            c4h  = get_candles(cfg["symbol"], 240, 120)
             c1h  = get_candles(cfg["symbol"], 60,  100)
             c15m = get_candles(cfg["symbol"], 15,  96)
-            log.info(f"  Candles: {len(c1h)} x 1H  |  {len(c15m)} x 15M")
+            log.info(f"  Candles: {len(c4h)}x4H | {len(c1h)}x1H | {len(c15m)}x15M")
         except Exception as e:
-            log.error(f"  Candle fetch error: {e}")
+            log.error(f"  Candle error: {e}")
             continue
 
-        px = c1h[-1]["close"]
+        px = c15m[-1]["close"] if c15m else c1h[-1]["close"]
         log.info(f"  Price: {px:,.2f}")
 
-        # S/R levels
-        sr = detect_sr_levels(c1h)
-        log.info(f"  S/R levels detected: {len(sr)}")
+        # S/R from 4H
+        sr = detect_sr_levels(c4h)
+        log.info(f"  4H S/R: {len(sr)} levels")
         for lv in sr[:5]:
-            log.info(f"    {lv['type']}  {lv['price']:,.2f}  (strength={lv['strength']})")
+            dist = (lv['price'] - px) / px * 100
+            log.info(f"    {lv['type']} {lv['price']:,.2f} (str={lv['strength']}) {dist:+.2f}%")
 
         # Signal
-        sig = detect_signal(c1h, c15m, sr)
+        sig = detect_signal(c4h, c1h, c15m, sr)
 
         if not sig:
-            log.info(f"  No signal for {asset} this hour.")
+            log.info(f"  No signal.")
             continue
 
         if not sig["confirmed"]:
-            log.info(f"  {sig['dir']} breakout at {sig['level']:,.2f} â€” awaiting 15M confirmation.")
+            log.info(f"  {sig['dir']} breakout at {sig['level']:,.2f} â€” waiting 15M confirmation.")
             continue
 
         # Position sizing
+        dp          = 1 if sig["entry"] > 1000 else 2
         risk_budget = balance * RISK_PERCENT / 100
         risk_per_c  = abs(sig["entry"] - sig["sl"])
         qty         = max(1, int(risk_budget / risk_per_c)) if risk_per_c > 0 else 1
         actual_risk = qty * risk_per_c
-        actual_tp   = qty * abs(sig["tp"] - sig["entry"])
 
-        dp = 1 if sig["entry"] > 1000 else 2
-        log.info(f"\n  *** SIGNAL CONFIRMED: {sig['dir']} {asset} ***")
+        log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{sig['tf']}] ***")
         log.info(f"  Entry     : {sig['entry']:,.{dp}f}")
-        log.info(f"  Stop Loss : {sig['sl']:,.{dp}f}  (risk per contract = {risk_per_c:.{dp}f})")
-        log.info(f"  Take Prof : {sig['tp']:,.{dp}f}  (reward = {abs(sig['tp']-sig['entry']):.{dp}f})")
+        log.info(f"  Stop Loss : {sig['sl']:,.{dp}f}")
+        log.info(f"  Take Prof : {sig['tp']:,.{dp}f}")
+        log.info(f"  Risk      : â‚¹{actual_risk:.0f} ({actual_risk/balance*100:.2f}%)")
         log.info(f"  Contracts : {qty}")
-        log.info(f"  Total risk: â‚¹{actual_risk:.0f}  |  Total reward: â‚¹{actual_tp:.0f}  -> 1:{int(RR_RATIO)} RR")
-        log.info(f"  Risk %    : {actual_risk/balance*100:.2f}% of balance")
 
-        # Place order
-        try:
-            resp   = place_bracket_order(pid, sig, qty, asset)
-            result = resp.get("result", {})
-            log.info(f"  Order placed! ID={result.get('id','?')}  state={result.get('state','?')}")
+        success = place_order_with_sl_tp(pid, sig, qty, asset)
+        if success:
             trades_placed += 1
             total_risk    += actual_risk
-        except requests.HTTPError as e:
-            log.error(f"  Order failed: {e.response.text if e.response else e}")
-        except Exception as e:
-            log.error(f"  Order error: {e}")
 
-    # Summary
+        break
+
     log.info(f"\n{'='*65}")
-    log.info(f"Run Summary:")
-    log.info(f"  Trades placed  : {trades_placed}")
-    log.info(f"  Total risk     : â‚¹{total_risk:.0f}")
-    log.info(f"  Balance        : â‚¹{balance:,.0f}")
-    log.info(f"  Risk % of bal  : {total_risk/balance*100:.2f}%")
-    log.info(f"{'='*65}")
+    log.info(f"Summary: trades={trades_placed} | risk=â‚¹{total_risk:.0f} | balance=â‚¹{balance:,.0f}")
     log.info("Run complete.")
 
 
