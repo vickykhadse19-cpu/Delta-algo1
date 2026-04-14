@@ -1,30 +1,25 @@
 """
-Delta Exchange India — BTC + ETH Professional Algo v7
-=====================================================
-Built for maximum profitability:
+Delta Exchange India — BTC + ETH Pro Algo v8
+============================================
+KEY FIX: Uses BOTH 4H and 1H S/R levels
+  4H levels = strong zones from big moves
+  1H levels = recent zones near current price
+  
+This means algo always has levels close to price
+and fires signals much faster.
 
-ENTRY:
-  4H S/R zones  (strongest levels — institutional zones)
-  15M candle breaks level with strong body  (breakout)
-  5M candle confirms direction  (fast entry — 5-10 min)
-  Volume above average on breakout  (real move filter)
-  4H trend alignment  (trade with the big money)
+Entry:
+  S/R level (4H strong OR 1H recent)
+  15M candle breaks level with strong body
+  5M candle confirms (5-10 min entry)
+  Volume filter on strong signals
+  4H trend alignment
 
-EXIT:
-  Dynamic RR:
-    Normal signal  → 1:6 RR
-    Strong signal  → 1:8 RR  (high strength level + volume)
-  Trailing stop at 35% of move (locks more profit)
-  Trail activates after 1.5x risk (earlier protection)
-
-RISK:
-  Strong signal  → 2.0% of balance
-  Normal signal  → 1.5% of balance
-  Max 3% total per run
-
-SPEED:
-  Scans every 15 min  (free on GitHub — 1,440 min/month)
-  Entry within 5-10 min of breakout
+Exit:
+  Strong 4H level  → 1:8 RR
+  Normal 4H level  → 1:6 RR
+  1H level         → 1:5 RR (smaller move expected)
+  Trailing stop 35% of move, starts at 1.5x risk
 """
 
 import os, time, hmac, hashlib, json, requests, logging
@@ -42,28 +37,29 @@ ASSETS = {
     "ETH": {"symbol": "ETHUSD", "product_id": None},
 }
 
-# Risk settings
-RISK_NORMAL    = 1.5   # % for normal signals
-RISK_STRONG    = 2.0   # % for strong signals (high str level + volume)
-MAX_TOTAL_RISK = 3.0   # % max per run
+# Risk
+RISK_NORMAL    = 1.5
+RISK_STRONG    = 2.0
+MAX_TOTAL_RISK = 3.0
 
-# RR settings
-RR_NORMAL  = 6.0   # 1:6 for normal signals
-RR_STRONG  = 8.0   # 1:8 for strong signals
+# RR based on signal type
+RR_STRONG_4H   = 8.0   # 4H strong level + volume + trend
+RR_NORMAL_4H   = 6.0   # 4H normal level
+RR_1H          = 5.0   # 1H level (smaller expected move)
 
-# Trailing stop
-TRAIL_TRIGGER  = 1.5   # earlier — activates after 1.5x risk in profit
-TRAIL_DISTANCE = 0.35  # 35% of move — slightly tighter than 40%
+# Trailing
+TRAIL_TRIGGER  = 1.5
+TRAIL_DISTANCE = 0.35
 
-# Signal filters
+# Filters
 SR_LOOKBACK       = 5
 SR_CLUSTER_TOL    = 0.003
 MIN_BREAK_PCT     = 0.0005
 MAX_BREAK_PCT     = 0.05
 MAX_SL_PCT        = 0.06
-MIN_BODY_PCT      = 0.40   # 15M candle body must be >40% of range
-VOL_MULTIPLIER    = 1.3    # volume must be 1.3x average for strong signal
-STRONG_STRENGTH   = 3      # S/R level strength >= 3 = strong signal
+MIN_BODY_PCT      = 0.35
+VOL_MULTIPLIER    = 1.2
+STRONG_STRENGTH   = 3
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
@@ -72,7 +68,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("delta_pro")
+log = logging.getLogger("delta_v8")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -124,7 +120,7 @@ def get_product_id(symbol):
             if t.get("symbol") == symbol:
                 return t.get("product_id")
     except Exception as e:
-        log.warning(f"  Ticker lookup: {e}")
+        log.warning(f"  Ticker: {e}")
     return None
 
 def get_candles(symbol, resolution, limit=150):
@@ -163,7 +159,7 @@ def get_wallet_balance():
                 log.info(f"  {b.get('asset_symbol')} balance: {val:.2f}")
                 return val
         return 0.0
-    except Exception as e:
+    except Exception:
         log.warning(f"  Balance failed — geo-block bypass active")
         return -1.0
 
@@ -188,9 +184,9 @@ def get_open_orders(product_id):
 
 
 # ─────────────────────────────────────────────────────────────
-#  S/R DETECTION  (4H = institutional levels)
+#  S/R DETECTION
 # ─────────────────────────────────────────────────────────────
-def detect_sr_levels(candles):
+def detect_sr_levels(candles, label=""):
     raw, n, lb = [], len(candles), SR_LOOKBACK
     for i in range(lb, n - lb):
         c = candles[i]
@@ -210,196 +206,180 @@ def detect_sr_levels(candles):
             "price":    sum(cluster) / len(cluster),
             "type":     a["type"],
             "strength": len(cluster),
+            "tf":       label,
         })
-    return sorted(out, key=lambda x: -x["strength"])[:12]
+    return sorted(out, key=lambda x: -x["strength"])[:15]
+
+
+def merge_sr_levels(sr_4h, sr_1h, px):
+    """
+    Combine 4H and 1H levels.
+    Remove duplicates within 0.3% of each other.
+    Keep 4H levels as higher priority.
+    Only keep levels within 8% of current price.
+    """
+    all_levels = []
+
+    # Add 4H levels first (higher priority)
+    for l in sr_4h:
+        dist = abs(l["price"] - px) / px
+        if dist <= 0.08:  # within 8%
+            all_levels.append(l)
+
+    # Add 1H levels — skip if too close to existing 4H level
+    for l in sr_1h:
+        dist = abs(l["price"] - px) / px
+        if dist > 0.06:  # only within 6% for 1H
+            continue
+        # Check not duplicate of 4H level
+        is_dup = any(
+            abs(l["price"] - e["price"]) / e["price"] < SR_CLUSTER_TOL
+            for e in all_levels
+        )
+        if not is_dup:
+            all_levels.append(l)
+
+    return sorted(all_levels, key=lambda x: -x["strength"])
 
 
 # ─────────────────────────────────────────────────────────────
-#  4H TREND DETECTION
-#  Simple: last 4H candle direction = short-term 4H trend
-#  Plus: last 3 4H candles — majority direction
+#  4H TREND
 # ─────────────────────────────────────────────────────────────
 def get_4h_trend(c4h):
     if len(c4h) < 4:
         return "NEUTRAL"
-    last3 = c4h[-3:]
+    last3   = c4h[-3:]
     bullish = sum(1 for c in last3 if c["close"] > c["open"])
     bearish = sum(1 for c in last3 if c["close"] < c["open"])
-    if bullish >= 2:
-        return "BULL"
-    if bearish >= 2:
-        return "BEAR"
+    if bullish >= 2: return "BULL"
+    if bearish >= 2: return "BEAR"
     return "NEUTRAL"
 
 
 # ─────────────────────────────────────────────────────────────
-#  SIGNAL DETECTION — PROFESSIONAL VERSION
-#
-#  Filters applied:
-#  1. 4H level must exist near price
-#  2. 15M candle must CLOSE beyond level (not just wick)
-#  3. 15M candle body must be strong (>40% of range)
-#  4. 5M candle confirms direction
-#  5. Volume above average on 15M breakout candle
-#  6. 4H trend aligned with trade direction
-#
-#  Signal grades:
-#  STRONG: level strength>=3 + volume>=1.3x + trend aligned
-#          → 2.0% risk, 1:8 RR
-#  NORMAL: passes all filters but not all strong criteria
-#          → 1.5% risk, 1:6 RR
+#  SIGNAL DETECTION  (4H + 1H levels, 15M + 5M entry)
 # ─────────────────────────────────────────────────────────────
-def detect_signal(c4h, c15m, c5m, sr):
-    if len(c15m) < 3 or len(c5m) < 2 or not sr:
+def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
+    if len(c15m) < 2 or len(c5m) < 2 or not sr_combined:
         return None
 
     c15_curr = c15m[-1]
-    c15_prev = c15m[-2]
     c5_curr  = c5m[-1]
-
     px       = c5_curr["close"]
     trend    = get_4h_trend(c4h)
 
-    # Average volume last 20 candles
     avg_vol  = (sum(c["volume"] for c in c15m[-20:]) / 20
                 if len(c15m) >= 20 else 0)
-    high_vol = (c15_curr["volume"] >= avg_vol * VOL_MULTIPLIER
-                if avg_vol > 0 else False)
+    high_vol = c15_curr["volume"] >= avg_vol * VOL_MULTIPLIER if avg_vol > 0 else False
 
     def body_pct(c):
         rng = c["high"] - c["low"]
         return abs(c["close"] - c["open"]) / rng if rng > 0 else 0
 
-    def is_strong(strength):
-        return (strength >= STRONG_STRENGTH and high_vol and
-                trend in ("BULL", "BEAR"))
+    def get_rr_and_risk(level_data):
+        is_4h    = level_data["tf"] == "4H"
+        strength = level_data["strength"]
+        is_strong = (is_4h and strength >= STRONG_STRENGTH
+                     and high_vol and trend in ("BULL", "BEAR"))
+        if is_strong:
+            return RR_STRONG_4H, RISK_STRONG, "STRONG ⚡"
+        elif is_4h:
+            return RR_NORMAL_4H, RISK_NORMAL, "NORMAL 4H"
+        else:
+            return RR_1H, RISK_NORMAL, "NORMAL 1H"
 
     # ── LONG ─────────────────────────────────────────────────
-    # Only trade LONG if trend is BULL or NEUTRAL
     if trend != "BEAR":
         resistances = sorted(
-            [l for l in sr if l["type"] == "R" and l["price"] > px * 0.99],
+            [l for l in sr_combined if l["type"] == "R" and l["price"] > px * 0.99],
             key=lambda x: x["price"]
         )
-        for res in resistances[:6]:
+        for res in resistances[:8]:
             level = res["price"]
             brk   = (c15_curr["close"] - level) / level
+            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT): continue
+            if body_pct(c15_curr) < MIN_BODY_PCT: continue
 
-            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT):
-                continue
-            if body_pct(c15_curr) < MIN_BODY_PCT:
-                continue  # weak candle — skip
-
-            if c5_curr["close"] > level * 1.0003:
-                entry  = c5_curr["close"]
-                sl     = min(level * 0.997, c15_curr["low"], c5_curr["low"])
-                risk   = entry - sl
-                if risk <= 0 or risk / entry > MAX_SL_PCT:
-                    continue
-
-                strong = is_strong(res["strength"])
-                rr     = RR_STRONG if strong else RR_NORMAL
-                rsk    = RISK_STRONG if strong else RISK_NORMAL
-
+            if c5_curr["close"] > level * 1.0002:
+                entry = c5_curr["close"]
+                sl    = min(level * 0.997, c15_curr["low"], c5_curr["low"])
+                risk  = entry - sl
+                if risk <= 0 or risk / entry > MAX_SL_PCT: continue
+                rr, rsk, grade = get_rr_and_risk(res)
                 return {
-                    "dir":       "LONG",
-                    "entry":     entry,
-                    "sl":        sl,
-                    "tp":        entry + risk * rr,
-                    "level":     level,
-                    "risk":      risk,
-                    "rr":        rr,
-                    "risk_pct":  rsk,
-                    "confirmed": True,
-                    "strong":    strong,
-                    "tf":        "4H_SR+15M+5M",
-                    "strength":  res["strength"],
-                    "vol":       f"{c15_curr['volume']:.0f} "
-                                 f"({'HIGH' if high_vol else 'normal'})",
-                    "trend":     trend,
+                    "dir": "LONG", "entry": entry, "sl": sl,
+                    "tp": entry + risk * rr, "level": level,
+                    "risk": risk, "rr": rr, "risk_pct": rsk,
+                    "confirmed": True, "grade": grade,
+                    "tf": f"4H_SR+1H_SR+15M+5M",
+                    "level_tf": res["tf"],
+                    "strength": res["strength"],
+                    "vol": f"{'HIGH' if high_vol else 'normal'}",
+                    "trend": trend,
                 }
             else:
                 return {
-                    "dir": "LONG", "confirmed": False,
-                    "level": level,
-                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
+                    "dir": "LONG", "confirmed": False, "level": level,
+                    "level_tf": res["tf"],
+                    "msg": f"15M broke {level:.1f} ({res['tf']}) — waiting 5M",
                 }
 
     # ── SHORT ────────────────────────────────────────────────
-    # Only trade SHORT if trend is BEAR or NEUTRAL
     if trend != "BULL":
         supports = sorted(
-            [l for l in sr if l["type"] == "S" and l["price"] < px * 1.01],
+            [l for l in sr_combined if l["type"] == "S" and l["price"] < px * 1.01],
             key=lambda x: -x["price"]
         )
-        for sup in supports[:6]:
+        for sup in supports[:8]:
             level = sup["price"]
             brk   = (level - c15_curr["close"]) / level
+            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT): continue
+            if body_pct(c15_curr) < MIN_BODY_PCT: continue
 
-            if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT):
-                continue
-            if body_pct(c15_curr) < MIN_BODY_PCT:
-                continue
-
-            if c5_curr["close"] < level * 0.9997:
-                entry  = c5_curr["close"]
-                sl     = max(level * 1.003, c15_curr["high"], c5_curr["high"])
-                risk   = sl - entry
-                if risk <= 0 or risk / entry > MAX_SL_PCT:
-                    continue
-
-                strong = is_strong(sup["strength"])
-                rr     = RR_STRONG if strong else RR_NORMAL
-                rsk    = RISK_STRONG if strong else RISK_NORMAL
-
+            if c5_curr["close"] < level * 0.9998:
+                entry = c5_curr["close"]
+                sl    = max(level * 1.003, c15_curr["high"], c5_curr["high"])
+                risk  = sl - entry
+                if risk <= 0 or risk / entry > MAX_SL_PCT: continue
+                rr, rsk, grade = get_rr_and_risk(sup)
                 return {
-                    "dir":       "SHORT",
-                    "entry":     entry,
-                    "sl":        sl,
-                    "tp":        entry - risk * rr,
-                    "level":     level,
-                    "risk":      risk,
-                    "rr":        rr,
-                    "risk_pct":  rsk,
-                    "confirmed": True,
-                    "strong":    strong,
-                    "tf":        "4H_SR+15M+5M",
-                    "strength":  sup["strength"],
-                    "vol":       f"{c15_curr['volume']:.0f} "
-                                 f"({'HIGH' if high_vol else 'normal'})",
-                    "trend":     trend,
+                    "dir": "SHORT", "entry": entry, "sl": sl,
+                    "tp": entry - risk * rr, "level": level,
+                    "risk": risk, "rr": rr, "risk_pct": rsk,
+                    "confirmed": True, "grade": grade,
+                    "tf": f"4H_SR+1H_SR+15M+5M",
+                    "level_tf": sup["tf"],
+                    "strength": sup["strength"],
+                    "vol": f"{'HIGH' if high_vol else 'normal'}",
+                    "trend": trend,
                 }
             else:
                 return {
-                    "dir": "SHORT", "confirmed": False,
-                    "level": level,
-                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
+                    "dir": "SHORT", "confirmed": False, "level": level,
+                    "level_tf": sup["tf"],
+                    "msg": f"15M broke {level:.1f} ({sup['tf']}) — waiting 5M",
                 }
 
     return None
 
 
 # ─────────────────────────────────────────────────────────────
-#  TRAILING STOP  (activates at 1.5x risk, trails at 35%)
+#  TRAILING STOP
 # ─────────────────────────────────────────────────────────────
 def calculate_trail_sl(direction, entry, current_sl, orig_risk, px):
     if direction == "LONG":
-        if px - entry < orig_risk * TRAIL_TRIGGER:
-            return None
+        if px - entry < orig_risk * TRAIL_TRIGGER: return None
         new_sl = round(px - (px - entry) * TRAIL_DISTANCE, 2)
         return new_sl if new_sl > current_sl else None
     else:
-        if entry - px < orig_risk * TRAIL_TRIGGER:
-            return None
+        if entry - px < orig_risk * TRAIL_TRIGGER: return None
         new_sl = round(px + (entry - px) * TRAIL_DISTANCE, 2)
         return new_sl if new_sl < current_sl else None
 
 
 def manage_open_positions(open_positions, c5m_by_asset):
-    if not open_positions:
-        return
+    if not open_positions: return
     log.info(f"\n  Managing {len(open_positions)} open position(s)...")
-
     for pid, pos in open_positions.items():
         try:
             size   = float(pos.get("size", 0) or 0)
@@ -410,36 +390,33 @@ def manage_open_positions(open_positions, c5m_by_asset):
             asset  = "BTC" if "BTC" in symbol else "ETH"
             c5m    = c5m_by_asset.get(asset, [])
             if not c5m: continue
-
             px  = c5m[-1]["close"]
             dp  = 1 if entry > 1000 else 2
             pnl = px - entry if dir_ == "LONG" else entry - px
             log.info(f"  {asset} {dir_} | Entry={entry:.{dp}f} | "
                      f"Now={px:.{dp}f} | P/L={pnl:+.{dp}f}")
-
             sl_orders = [o for o in get_open_orders(pid)
                          if o.get("order_type") == "stop_market_order"]
             if not sl_orders:
                 log.info(f"    No SL order found.")
                 continue
-
             sl_ord     = sl_orders[0]
             current_sl = float(sl_ord.get("stop_price", 0) or 0)
             orig_risk  = abs(entry - current_sl)
             if not orig_risk: continue
-
             new_sl = calculate_trail_sl(dir_, entry, current_sl, orig_risk, px)
             if new_sl:
-                log.info(f"    Trail: {current_sl:.{dp}f} → {new_sl:.{dp}f} ✅")
+                log.info(f"    Trail: {current_sl:.{dp}f} → {new_sl:.{dp}f}")
                 try:
                     api_put(f"/v2/orders/{sl_ord['id']}",
                             {"id": sl_ord["id"], "stop_price": str(new_sl)})
+                    log.info(f"    SL updated ✅")
                 except Exception as e:
                     log.warning(f"    SL update failed: {e}")
             else:
                 trig = (entry + orig_risk * TRAIL_TRIGGER if dir_ == "LONG"
                         else entry - orig_risk * TRAIL_TRIGGER)
-                log.info(f"    Trail activates at {trig:.{dp}f} "
+                log.info(f"    Trail at {trig:.{dp}f} "
                          f"(need {abs(trig-px):.{dp}f} more pts)")
         except Exception as e:
             log.warning(f"  Manage error: {e}")
@@ -463,7 +440,6 @@ def place_order(product_id, sig, qty, symbol):
                  f"TP={tp_price} | RR=1:{int(sig['rr'])}")
         return True
 
-    # Method 1: Bracket order
     try:
         r = api_post("/v2/orders", {
             "product_id":                      product_id,
@@ -482,9 +458,8 @@ def place_order(product_id, sig, qty, symbol):
                  f"TP={tp_price} | RR=1:{int(sig['rr'])}")
         return True
     except requests.HTTPError:
-        log.warning(f"  Bracket failed — trying fallback...")
+        log.warning(f"  Bracket failed — fallback...")
 
-    # Method 2: Fallback
     try:
         er = api_post("/v2/orders", {
             "product_id": product_id, "size": qty,
@@ -498,19 +473,16 @@ def place_order(product_id, sig, qty, symbol):
             "order_type": "stop_market_order", "time_in_force": "gtc",
             "stop_price": str(sl_price), "close_on_trigger": True,
         })
-        log.info(f"  SL set at {sl_price}")
         api_post("/v2/orders", {
             "product_id": product_id, "size": qty, "side": close,
             "order_type": "take_profit_market_order", "time_in_force": "gtc",
             "stop_price": str(tp_price), "close_on_trigger": True,
         })
-        log.info(f"  TP set at {tp_price}")
-        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | "
-                 f"TP={tp_price} | RR=1:{int(sig['rr'])}")
+        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price}")
         return True
     except Exception as e:
-        log.error(f"  All methods failed: {e}")
-        log.error(f"  SET MANUALLY → SL={sl_price}  TP={tp_price}")
+        log.error(f"  All failed: {e}")
+        log.error(f"  MANUAL: SL={sl_price} TP={tp_price}")
         return False
 
 
@@ -519,19 +491,18 @@ def place_order(product_id, sig, qty, symbol):
 # ─────────────────────────────────────────────────────────────
 def run():
     log.info("=" * 65)
-    log.info(f"Delta Pro v7 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    log.info(f"Delta Pro v8 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | "
              f"Risk={RISK_NORMAL}-{RISK_STRONG}% | "
-             f"RR=1:{int(RR_NORMAL)}/1:{int(RR_STRONG)} | "
-             f"Trail@{int(TRAIL_DISTANCE*100)}% | "
-             f"4H_SR+15M+5M+VOL+TREND")
+             f"RR=1:5/1:6/1:8 | Trail@35% | "
+             f"4H+1H levels | 15M+5M entry")
     log.info("=" * 65)
 
     if not API_KEY or not API_SECRET:
         log.error("API keys not set.")
         return
 
-    # Step 1 — Product IDs
+    # Product IDs
     log.info("Resolving product IDs...")
     for asset, cfg in ASSETS.items():
         pid = get_product_id(cfg["symbol"])
@@ -541,7 +512,7 @@ def run():
         else:
             log.warning(f"  {asset}: not found")
 
-    # Step 2 — Balance
+    # Balance
     if DRY_RUN:
         balance = 25000.0
         log.info(f"[DRY RUN] Mock balance = Rs.{balance:,.0f}")
@@ -551,31 +522,33 @@ def run():
             balance = 5000.0
             log.info(f"  Geo-block bypass — Rs.{balance:,.0f}")
         elif raw_bal < 700:
-            log.warning(f"  Balance too low. Add funds.")
+            log.warning(f"  Balance too low.")
             return
         else:
             balance = raw_bal
             log.info(f"  Live balance: Rs.{balance:,.0f}")
 
-    # Step 3 — Fetch candles
+    # Fetch candles
     c4h_by  = {}
+    c1h_by  = {}
     c15m_by = {}
     c5m_by  = {}
     for asset, cfg in ASSETS.items():
         try:
             c4h_by[asset]  = get_candles(cfg["symbol"], 240, 120)
+            c1h_by[asset]  = get_candles(cfg["symbol"], 60,  100)
             c15m_by[asset] = get_candles(cfg["symbol"], 15,  100)
             c5m_by[asset]  = get_candles(cfg["symbol"], 5,   100)
         except Exception as e:
             log.error(f"  Candle error {asset}: {e}")
 
-    # Step 4 — Manage open positions (trailing stop)
+    # Manage open positions
     if not DRY_RUN:
         open_pos = get_open_positions()
         if open_pos:
             manage_open_positions(open_pos, c5m_by)
 
-    # Step 5 — Scan for new signals
+    # Scan for signals
     trades_placed = 0
     total_risk    = 0.0
 
@@ -585,12 +558,11 @@ def run():
         log.info(f"{'─'*50}")
 
         if total_risk >= balance * MAX_TOTAL_RISK / 100:
-            log.info("  Max total risk reached. Stopping.")
+            log.info("  Max risk reached.")
             break
 
         pid = cfg.get("product_id")
-        if not pid:
-            continue
+        if not pid: continue
 
         if not DRY_RUN:
             op = get_open_positions()
@@ -599,63 +571,65 @@ def run():
                 continue
 
         c4h  = c4h_by.get(asset,  [])
+        c1h  = c1h_by.get(asset,  [])
         c15m = c15m_by.get(asset, [])
         c5m  = c5m_by.get(asset,  [])
 
-        if not c4h or not c15m or not c5m:
+        if not c4h or not c1h or not c15m or not c5m:
             continue
 
         px    = c5m[-1]["close"]
         trend = get_4h_trend(c4h)
         dp    = 1 if px > 1000 else 2
 
-        log.info(f"  Price : {px:,.2f}")
+        log.info(f"  Price    : {px:,.2f}")
         log.info(f"  4H Trend : {trend}")
-        log.info(f"  Candles: {len(c4h)}x4H | {len(c15m)}x15M | {len(c5m)}x5M")
+        log.info(f"  Candles  : {len(c4h)}x4H | {len(c1h)}x1H | "
+                 f"{len(c15m)}x15M | {len(c5m)}x5M")
 
-        sr = detect_sr_levels(c4h)
-        log.info(f"  4H S/R: {len(sr)} levels")
-        for lv in sr[:6]:
+        # Build S/R from BOTH 4H and 1H
+        sr_4h = detect_sr_levels(c4h, "4H")
+        sr_1h = detect_sr_levels(c1h, "1H")
+        sr    = merge_sr_levels(sr_4h, sr_1h, px)
+
+        log.info(f"  S/R levels: {len([l for l in sr if l['tf']=='4H'])} from 4H "
+                 f"+ {len([l for l in sr if l['tf']=='1H'])} from 1H "
+                 f"= {len(sr)} total near price")
+
+        for lv in sr[:8]:
             dist = (lv['price'] - px) / px * 100
             tag  = " ← STRONG" if lv["strength"] >= STRONG_STRENGTH else ""
-            log.info(f"    {lv['type']} {lv['price']:,.2f} "
+            log.info(f"    [{lv['tf']}] {lv['type']} {lv['price']:,.{dp}f} "
                      f"(str={lv['strength']}) {dist:+.2f}%{tag}")
 
-        sig = detect_signal(c4h, c15m, c5m, sr)
+        sig = detect_signal(c4h, c1h, c15m, c5m, sr)
 
         if not sig:
-            log.info(f"  No signal — not near any 4H level.")
+            log.info(f"  No signal — no level being tested right now.")
             continue
 
         if not sig["confirmed"]:
-            log.info(f"  {sig['dir']} near {sig['level']:,.2f} — "
-                     f"{sig.get('msg','waiting 5M candle')}")
+            log.info(f"  {sig['dir']} near [{sig['level_tf']}] "
+                     f"{sig['level']:,.{dp}f} — {sig.get('msg','...')}")
             continue
 
-        # Confirmed signal
-        grade      = "STRONG ⚡" if sig["strong"] else "NORMAL"
-        risk_pct   = sig["risk_pct"]
-        rr         = sig["rr"]
-        risk_budget = balance * risk_pct / 100
+        # Place trade
+        risk_budget = balance * sig["risk_pct"] / 100
         risk_per_c  = abs(sig["entry"] - sig["sl"])
         qty         = max(1, int(risk_budget / risk_per_c)) if risk_per_c > 0 else 1
         actual_risk = qty * risk_per_c
         actual_tp   = qty * abs(sig["tp"] - sig["entry"])
 
-        log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{grade}] ***")
-        log.info(f"  Timeframe  : {sig['tf']}")
-        log.info(f"  4H Level   : {sig['level']:,.{dp}f} (strength={sig['strength']})")
+        log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{sig['grade']}] ***")
+        log.info(f"  Level TF   : {sig['level_tf']} level at {sig['level']:,.{dp}f}")
         log.info(f"  4H Trend   : {sig['trend']}")
         log.info(f"  Volume     : {sig['vol']}")
         log.info(f"  Entry      : {sig['entry']:,.{dp}f}")
         log.info(f"  Stop Loss  : {sig['sl']:,.{dp}f}")
-        log.info(f"  Take Profit: {sig['tp']:,.{dp}f}  (1:{int(rr)} RR)")
-        log.info(f"  Risk       : Rs.{actual_risk:.0f}  ({risk_pct}% of balance)")
+        log.info(f"  Take Profit: {sig['tp']:,.{dp}f}  (1:{int(sig['rr'])} RR)")
+        log.info(f"  Risk       : Rs.{actual_risk:.0f} ({sig['risk_pct']}%)")
         log.info(f"  Reward     : Rs.{actual_tp:.0f}")
         log.info(f"  Contracts  : {qty}")
-        log.info(f"  Trail SL   : starts after "
-                 f"+{risk_per_c * TRAIL_TRIGGER:.{dp}f} pts "
-                 f"| trails at {int(TRAIL_DISTANCE*100)}%")
 
         success = place_order(pid, sig, qty, asset)
         if success:
