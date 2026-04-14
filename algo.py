@@ -1,9 +1,10 @@
 """
-Delta Exchange India â€” BTC + ETH Multi-Timeframe Breakout Algo v3
+Delta Exchange India — BTC + ETH Multi-Timeframe Breakout Algo v4
 =================================================================
 Strategy : 4H S/R detection -> 1H confirm -> 15M entry
-           Bracket order with SL + TP 1:4
-           Fallback: separate SL/TP orders if bracket fails
+           RR Ratio : 1:6  (better for 4H moves)
+           Trailing Stop : moves SL up as price moves in favor
+           Not too tight — trails at 40% of move
 Exchange : Delta Exchange India
 Assets   : BTCUSD + ETHUSD
 Risk     : 1.5% per trade
@@ -13,9 +14,9 @@ Runs     : Every 15 minutes via GitHub Actions
 import os, time, hmac, hashlib, json, requests, logging
 from datetime import datetime, timezone
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
 #  CONFIGURATION
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
 API_KEY    = os.environ.get("DELTA_API_KEY",    "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 BASE_URL   = "https://api.india.delta.exchange"
@@ -26,7 +27,11 @@ ASSETS = {
 }
 
 RISK_PERCENT   = 1.5
-RR_RATIO       = 6.0
+RR_RATIO       = 6.0    # upgraded from 4.0 → better for 4H moves
+TRAIL_TRIGGER  = 2.0    # start trailing only after 2x risk is in profit
+                        # prevents premature trailing on small moves
+TRAIL_DISTANCE = 0.4    # trail SL at 40% below highest point
+                        # not too tight — gives trade room to breathe
 SR_LOOKBACK    = 5
 SR_CLUSTER_TOL = 0.003
 MIN_BREAK_PCT  = 0.001
@@ -40,12 +45,12 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("delta_algo_v3")
+log = logging.getLogger("delta_algo_v4")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
 #  AUTH
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
 def auth_headers(method, path, query_string="", body=""):
     timestamp = str(int(time.time()))
     message   = method + timestamp + path
@@ -83,10 +88,21 @@ def api_post(path, payload):
     r.raise_for_status()
     return r.json()
 
+def api_put(path, payload):
+    body = json.dumps(payload, separators=(",", ":"))
+    r    = requests.put(
+        BASE_URL + path,
+        headers=auth_headers("PUT", path, "", body),
+        data=body,
+        timeout=15
+    )
+    r.raise_for_status()
+    return r.json()
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+# ─────────────────────────────────────────────────────────────
 #  MARKET DATA
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
 def get_product_id(symbol):
     try:
         url = f"{BASE_URL}/v2/tickers?contract_types=perpetual_futures"
@@ -137,25 +153,41 @@ def get_wallet_balance():
                 return val
         return 0.0
     except Exception as e:
-        log.warning(f"  Balance fetch failed ({e}) â€” using fallback")
+        log.warning(f"  Balance fetch failed ({e}) — using fallback")
         return -1.0
 
 
-def get_open_position(product_id):
+def get_open_positions():
+    """Returns all open positions as dict keyed by product_id."""
     try:
-        data = api_get("/v2/positions", {"product_id": product_id})
-        pos  = data.get("result", {})
-        if isinstance(pos, list):
-            pos = pos[0] if pos else {}
-        size = float(pos.get("size", 0) or 0)
-        return pos if size != 0 else None
+        data = api_get("/v2/positions/margined")
+        result = data.get("result", [])
+        if isinstance(result, list):
+            return {
+                p["product_id"]: p
+                for p in result
+                if float(p.get("size", 0) or 0) != 0
+            }
+        return {}
     except Exception:
-        return None
+        return {}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  S/R DETECTION  (4H candles = stronger zones)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def get_open_orders(product_id):
+    """Get open stop/tp orders for a product."""
+    try:
+        data = api_get("/v2/orders", {
+            "product_id": product_id,
+            "state": "open",
+        })
+        return data.get("result", [])
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────
+#  S/R DETECTION  (4H candles = strongest zones)
+# ─────────────────────────────────────────────────────────────
 def detect_sr_levels(candles):
     raw, n, lb = [], len(candles), SR_LOOKBACK
     for i in range(lb, n - lb):
@@ -180,9 +212,9 @@ def detect_sr_levels(candles):
     return sorted(out, key=lambda x: -x["strength"])[:12]
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  SIGNAL DETECTION  (4H + 1H + 15M confirmation)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
+#  SIGNAL DETECTION  (4H + 1H + 15M)
+# ─────────────────────────────────────────────────────────────
 def detect_signal(c4h, c1h, c15m, sr):
     if len(c4h) < 10 or len(c1h) < 10 or not sr:
         return None
@@ -207,10 +239,14 @@ def detect_signal(c4h, c1h, c15m, sr):
                     risk  = entry - sl
                     if 0 < risk / entry < MAX_SL_PCT:
                         return {
-                            "dir": "LONG", "entry": entry, "sl": sl,
-                            "tp": entry + risk * RR_RATIO,
-                            "level": res["price"], "risk": risk,
-                            "confirmed": True, "tf": "4H+1H+15M",
+                            "dir":       "LONG",
+                            "entry":     entry,
+                            "sl":        sl,
+                            "tp":        entry + risk * RR_RATIO,
+                            "level":     res["price"],
+                            "risk":      risk,
+                            "confirmed": True,
+                            "tf":        "4H+1H+15M",
                         }
             else:
                 return {"dir": "LONG", "confirmed": False, "level": res["price"]}
@@ -230,10 +266,14 @@ def detect_signal(c4h, c1h, c15m, sr):
                     risk  = sl - entry
                     if 0 < risk / entry < MAX_SL_PCT:
                         return {
-                            "dir": "SHORT", "entry": entry, "sl": sl,
-                            "tp": entry - risk * RR_RATIO,
-                            "level": sup["price"], "risk": risk,
-                            "confirmed": True, "tf": "4H+1H+15M",
+                            "dir":       "SHORT",
+                            "entry":     entry,
+                            "sl":        sl,
+                            "tp":        entry - risk * RR_RATIO,
+                            "level":     sup["price"],
+                            "risk":      risk,
+                            "confirmed": True,
+                            "tf":        "4H+1H+15M",
                         }
             else:
                 return {"dir": "SHORT", "confirmed": False, "level": sup["price"]}
@@ -241,11 +281,74 @@ def detect_signal(c4h, c1h, c15m, sr):
     return None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
+#  TRAILING STOP LOGIC
+#  Only activates after price moves 2x risk in your favor
+#  Trails at 40% of total move — not too tight
+#
+#  Example (LONG BTC):
+#   Entry = 71,628   Risk = 228
+#   Trail starts when price hits 72,084 (entry + 2×228)
+#   If price reaches 74,000:
+#     Total move = 74,000 - 71,628 = 2,372
+#     Trail SL   = 74,000 - (2,372 × 0.40) = 73,051
+#   Price must DROP 40% of the move to trigger SL
+#   Locks in 60% of profits automatically
+# ─────────────────────────────────────────────────────────────
+def calculate_trail_sl(sig, current_price):
+    """
+    Returns new SL price if trailing stop should be updated.
+    Returns None if not yet triggered or no update needed.
+    """
+    entry = sig["entry"]
+    risk  = sig["risk"]
+    orig_sl = sig["sl"]
+
+    if sig["dir"] == "LONG":
+        move = current_price - entry
+        # Only trail after 2x risk in profit
+        if move < risk * TRAIL_TRIGGER:
+            return None
+        # New SL = current price minus 40% of total move
+        new_sl = current_price - (move * TRAIL_DISTANCE)
+        # Round to 2 decimal places
+        new_sl = round(new_sl, 2)
+        # Only update if new SL is higher than original SL
+        if new_sl > orig_sl:
+            return new_sl
+        return None
+
+    else:  # SHORT
+        move = entry - current_price
+        if move < risk * TRAIL_TRIGGER:
+            return None
+        new_sl = current_price + (move * TRAIL_DISTANCE)
+        new_sl = round(new_sl, 2)
+        if new_sl < orig_sl:
+            return new_sl
+        return None
+
+
+def update_stop_loss(product_id, order_id, new_sl_price, direction):
+    """Update existing stop loss order to new price."""
+    try:
+        payload = {
+            "id":         order_id,
+            "stop_price": str(new_sl_price),
+        }
+        api_put(f"/v2/orders/{order_id}", payload)
+        log.info(f"  Trailing SL updated to {new_sl_price}")
+        return True
+    except Exception as e:
+        log.warning(f"  Could not update SL: {e}")
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
 #  ORDER EXECUTION
-#  Method 1: Bracket order (entry + SL + TP in one)
-#  Method 2: Fallback â€” place entry first, then SL/TP separately
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#  Method 1: Bracket order (entry + SL + TP together)
+#  Method 2: Fallback — separate entry, SL, TP orders
+# ─────────────────────────────────────────────────────────────
 def place_order_with_sl_tp(product_id, sig, qty, symbol):
     side     = "buy"  if sig["dir"] == "LONG"  else "sell"
     close    = "sell" if sig["dir"] == "LONG"  else "buy"
@@ -254,106 +357,175 @@ def place_order_with_sl_tp(product_id, sig, qty, symbol):
     dp       = 1 if sig["entry"] > 1000 else 2
 
     if DRY_RUN:
-        log.info(f"  [DRY RUN] {symbol} {sig['dir']} order simulated.")
-        log.info(f"  Entry={sig['entry']:.{dp}f} SL={sl_price} TP={tp_price}")
+        log.info(f"  [DRY RUN] {symbol} {sig['dir']} simulated.")
+        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price}")
+        log.info(f"  Trail starts after {sig['risk']*TRAIL_TRIGGER:.{dp}f} points profit")
         return True
 
-    # â”€â”€ Method 1: Bracket order â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     sl_off = -0.5 if sig["dir"] == "LONG" else 0.5
     tp_off =  0.5 if sig["dir"] == "LONG" else -0.5
 
-    bracket_payload = {
-        "product_id":                      product_id,
-        "size":                            qty,
-        "side":                            side,
-        "order_type":                      "market_order",
-        "time_in_force":                   "gtc",
-        "bracket_stop_loss_price":         str(round(sl_price + sl_off, 2)),
-        "bracket_stop_loss_limit_price":   str(sl_price),
-        "bracket_take_profit_price":       str(round(tp_price + tp_off, 2)),
-        "bracket_take_profit_limit_price": str(tp_price),
-    }
-
+    # Method 1 — Bracket order
     try:
+        bracket_payload = {
+            "product_id":                      product_id,
+            "size":                            qty,
+            "side":                            side,
+            "order_type":                      "market_order",
+            "time_in_force":                   "gtc",
+            "bracket_stop_loss_price":         str(round(sl_price + sl_off, 2)),
+            "bracket_stop_loss_limit_price":   str(sl_price),
+            "bracket_take_profit_price":       str(round(tp_price + tp_off, 2)),
+            "bracket_take_profit_limit_price": str(tp_price),
+        }
         resp   = api_post("/v2/orders", bracket_payload)
         result = resp.get("result", {})
-        log.info(f"  âœ… Bracket order placed! ID={result.get('id','?')} state={result.get('state','?')}")
+        log.info(f"  Bracket order placed! ID={result.get('id','?')}")
         log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price} | RR=1:{int(RR_RATIO)}")
+        log.info(f"  Trail activates after +{sig['risk']*TRAIL_TRIGGER:.{dp}f} points")
         return True
     except requests.HTTPError as e:
-        err = e.response.text if e.response else str(e)
-        log.warning(f"  Bracket order failed: {err}")
-        log.info(f"  Trying fallback method...")
+        log.warning(f"  Bracket failed — trying fallback...")
 
-    # â”€â”€ Method 2: Fallback â€” market entry + separate SL/TP â”€â”€â”€
+    # Method 2 — Fallback: separate orders
     try:
-        # Step A: Place market entry order
-        entry_payload = {
-            "product_id":   product_id,
-            "size":         qty,
-            "side":         side,
-            "order_type":   "market_order",
+        entry_resp = api_post("/v2/orders", {
+            "product_id":    product_id,
+            "size":          qty,
+            "side":          side,
+            "order_type":    "market_order",
             "time_in_force": "gtc",
-        }
-        entry_resp = api_post("/v2/orders", entry_payload)
-        entry_result = entry_resp.get("result", {})
-        log.info(f"  âœ… Entry order placed! ID={entry_result.get('id','?')}")
-
-        # Wait 2 seconds for order to fill
+        })
+        log.info(f"  Entry placed! ID={entry_resp.get('result',{}).get('id','?')}")
         time.sleep(2)
 
-        # Step B: Place Stop Loss order
-        sl_payload = {
-            "product_id":   product_id,
-            "size":         qty,
-            "side":         close,
-            "order_type":   "stop_market_order",
-            "time_in_force": "gtc",
-            "stop_price":   str(sl_price),
+        api_post("/v2/orders", {
+            "product_id":       product_id,
+            "size":             qty,
+            "side":             close,
+            "order_type":       "stop_market_order",
+            "time_in_force":    "gtc",
+            "stop_price":       str(sl_price),
             "close_on_trigger": True,
-        }
-        sl_resp = api_post("/v2/orders", sl_payload)
-        log.info(f"  âœ… Stop Loss set at {sl_price}")
+        })
+        log.info(f"  SL set at {sl_price}")
 
-        # Step C: Place Take Profit order
-        tp_payload = {
-            "product_id":   product_id,
-            "size":         qty,
-            "side":         close,
-            "order_type":   "take_profit_market_order",
-            "time_in_force": "gtc",
-            "stop_price":   str(tp_price),
+        api_post("/v2/orders", {
+            "product_id":       product_id,
+            "size":             qty,
+            "side":             close,
+            "order_type":       "take_profit_market_order",
+            "time_in_force":    "gtc",
+            "stop_price":       str(tp_price),
             "close_on_trigger": True,
-        }
-        tp_resp = api_post("/v2/orders", tp_payload)
-        log.info(f"  âœ… Take Profit set at {tp_price}")
+        })
+        log.info(f"  TP set at {tp_price}")
         log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price} | RR=1:{int(RR_RATIO)}")
+        log.info(f"  Trail activates after +{sig['risk']*TRAIL_TRIGGER:.{dp}f} points")
         return True
 
-    except requests.HTTPError as e:
-        err = e.response.text if e.response else str(e)
-        log.error(f"  âŒ Fallback also failed: {err}")
-        log.error(f"  âš ï¸  MANUAL ACTION NEEDED: Set SL={sl_price} TP={tp_price} on Delta Exchange app!")
-        return False
     except Exception as e:
-        log.error(f"  âŒ Unexpected error: {e}")
+        log.error(f"  All methods failed: {e}")
+        log.error(f"  SET MANUALLY: SL={sl_price} TP={tp_price}")
         return False
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
+#  MANAGE OPEN POSITIONS (trailing stop)
+# ─────────────────────────────────────────────────────────────
+def manage_open_positions(open_positions, c15m_by_asset):
+    """
+    Check all open positions and update trailing stops if needed.
+    Runs every 15 minutes automatically.
+    """
+    if not open_positions:
+        return
+
+    log.info(f"\n  Managing {len(open_positions)} open position(s)...")
+
+    for pid, pos in open_positions.items():
+        try:
+            size = float(pos.get("size", 0) or 0)
+            if size == 0:
+                continue
+
+            symbol    = pos.get("product_symbol", "")
+            entry     = float(pos.get("entry_price", 0) or 0)
+            direction = "LONG" if size > 0 else "SHORT"
+
+            # Get current price from 15M candles
+            asset  = "BTC" if "BTC" in symbol else "ETH"
+            c15m   = c15m_by_asset.get(asset, [])
+            if not c15m:
+                continue
+            current_price = c15m[-1]["close"]
+
+            # Calculate current profit
+            if direction == "LONG":
+                profit_pts = current_price - entry
+            else:
+                profit_pts = entry - current_price
+
+            dp = 1 if entry > 1000 else 2
+            log.info(f"  {asset} {direction} | Entry={entry:.{dp}f} | "
+                     f"Now={current_price:.{dp}f} | P/L={profit_pts:+.{dp}f}")
+
+            # Reconstruct sig dict for trailing calculation
+            # Get original SL from open orders
+            orders    = get_open_orders(pid)
+            sl_orders = [o for o in orders if o.get("order_type") == "stop_market_order"]
+
+            if not sl_orders:
+                log.info(f"    No SL order found — skipping trail")
+                continue
+
+            sl_order    = sl_orders[0]
+            current_sl  = float(sl_order.get("stop_price", 0) or 0)
+            orig_risk   = abs(entry - current_sl)
+
+            if orig_risk <= 0:
+                continue
+
+            sig_mock = {
+                "dir":    direction,
+                "entry":  entry,
+                "sl":     current_sl,
+                "risk":   orig_risk,
+            }
+
+            new_sl = calculate_trail_sl(sig_mock, current_price)
+
+            if new_sl and new_sl != current_sl:
+                log.info(f"    Trailing SL: {current_sl:.{dp}f} → {new_sl:.{dp}f}")
+                update_stop_loss(pid, sl_order["id"], new_sl, direction)
+            else:
+                trail_trigger_price = (
+                    entry + orig_risk * TRAIL_TRIGGER
+                    if direction == "LONG"
+                    else entry - orig_risk * TRAIL_TRIGGER
+                )
+                remaining = abs(trail_trigger_price - current_price)
+                log.info(f"    Trail not yet active. Need {remaining:.{dp}f} more points.")
+
+        except Exception as e:
+            log.warning(f"  Position management error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
 #  MAIN
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────
 def run():
     log.info("=" * 65)
-    log.info(f"Delta Algo v3 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | Risk={RISK_PERCENT}% | RR=1:{int(RR_RATIO)} | 4H+1H+15M")
+    log.info(f"Delta Algo v4 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | Risk={RISK_PERCENT}% | "
+             f"RR=1:{int(RR_RATIO)} | Trail@{int(TRAIL_DISTANCE*100)}% | 4H+1H+15M")
     log.info("=" * 65)
 
     if not API_KEY or not API_SECRET:
-        log.error("API keys not set. Add to GitHub Secrets.")
+        log.error("API keys not set.")
         return
 
-    # Step 1 â€” Product IDs
+    # Step 1 — Product IDs
     log.info("Resolving product IDs...")
     for asset, cfg in ASSETS.items():
         pid = get_product_id(cfg["symbol"])
@@ -363,30 +535,52 @@ def run():
         else:
             log.warning(f"  {asset}: not found")
 
-    # Step 2 â€” Balance
+    # Step 2 — Balance
     if DRY_RUN:
         balance = 25000.0
-        log.info(f"[DRY RUN] Mock balance = â‚¹{balance:,.0f}")
+        log.info(f"[DRY RUN] Mock balance = Rs.{balance:,.0f}")
     else:
         raw_bal = get_wallet_balance()
         if raw_bal == -1.0:
             balance = 5000.0
-            log.info(f"  Geo-block bypass â€” fallback â‚¹{balance:,.0f}")
+            log.info(f"  Geo-block bypass — fallback Rs.{balance:,.0f}")
         elif raw_bal < 700:
-            log.warning(f"  Balance â‚¹{raw_bal:.0f} too low. Add funds.")
+            log.warning(f"  Balance too low. Add funds.")
             return
         else:
             balance = raw_bal
-            log.info(f"  Live balance: â‚¹{balance:,.0f} âœ…")
+            log.info(f"  Live balance: Rs.{balance:,.0f}")
 
-    # Step 3 â€” Analyse assets
+    # Step 3 — Fetch candles for all assets first
+    c15m_by_asset = {}
+    c4h_by_asset  = {}
+    c1h_by_asset  = {}
+
+    for asset, cfg in ASSETS.items():
+        try:
+            c4h  = get_candles(cfg["symbol"], 240, 120)
+            c1h  = get_candles(cfg["symbol"], 60,  100)
+            c15m = get_candles(cfg["symbol"], 15,  96)
+            c4h_by_asset[asset]  = c4h
+            c1h_by_asset[asset]  = c1h
+            c15m_by_asset[asset] = c15m
+        except Exception as e:
+            log.error(f"  Candle fetch failed for {asset}: {e}")
+
+    # Step 4 — Manage open positions (trailing stop)
+    if not DRY_RUN:
+        open_positions = get_open_positions()
+        if open_positions:
+            manage_open_positions(open_positions, c15m_by_asset)
+
+    # Step 5 — Look for new signals
     trades_placed = 0
     total_risk    = 0.0
 
     for asset, cfg in ASSETS.items():
-        log.info(f"\n{'â”€'*50}")
+        log.info(f"\n{'─'*50}")
         log.info(f"Analysing {asset} ({cfg['symbol']})")
-        log.info(f"{'â”€'*50}")
+        log.info(f"{'─'*50}")
 
         if total_risk >= balance * 0.04:
             log.info("  Max risk reached. Stopping.")
@@ -394,34 +588,33 @@ def run():
 
         pid = cfg.get("product_id")
         if not pid:
-            log.warning(f"  No product_id. Skipping.")
             continue
 
+        # Skip if already in position
         if not DRY_RUN:
-            pos = get_open_position(pid)
-            if pos:
-                log.info(f"  Open position exists. Skipping.")
+            open_positions = get_open_positions()
+            if pid in open_positions:
+                log.info(f"  Open position exists — trailing stop active.")
                 continue
 
-        # Fetch 3 timeframes
-        try:
-            c4h  = get_candles(cfg["symbol"], 240, 120)
-            c1h  = get_candles(cfg["symbol"], 60,  100)
-            c15m = get_candles(cfg["symbol"], 15,  96)
-            log.info(f"  Candles: {len(c4h)}x4H | {len(c1h)}x1H | {len(c15m)}x15M")
-        except Exception as e:
-            log.error(f"  Candle error: {e}")
+        c4h  = c4h_by_asset.get(asset,  [])
+        c1h  = c1h_by_asset.get(asset,  [])
+        c15m = c15m_by_asset.get(asset, [])
+
+        if not c4h or not c1h:
             continue
 
         px = c15m[-1]["close"] if c15m else c1h[-1]["close"]
         log.info(f"  Price: {px:,.2f}")
+        log.info(f"  Candles: {len(c4h)}x4H | {len(c1h)}x1H | {len(c15m)}x15M")
 
         # S/R from 4H
         sr = detect_sr_levels(c4h)
         log.info(f"  4H S/R: {len(sr)} levels")
         for lv in sr[:5]:
             dist = (lv['price'] - px) / px * 100
-            log.info(f"    {lv['type']} {lv['price']:,.2f} (str={lv['strength']}) {dist:+.2f}%")
+            log.info(f"    {lv['type']} {lv['price']:,.2f} "
+                     f"(str={lv['strength']}) {dist:+.2f}%")
 
         # Signal
         sig = detect_signal(c4h, c1h, c15m, sr)
@@ -431,7 +624,7 @@ def run():
             continue
 
         if not sig["confirmed"]:
-            log.info(f"  {sig['dir']} breakout at {sig['level']:,.2f} â€” waiting 15M confirmation.")
+            log.info(f"  {sig['dir']} at {sig['level']:,.2f} — waiting 15M.")
             continue
 
         # Position sizing
@@ -440,23 +633,30 @@ def run():
         risk_per_c  = abs(sig["entry"] - sig["sl"])
         qty         = max(1, int(risk_budget / risk_per_c)) if risk_per_c > 0 else 1
         actual_risk = qty * risk_per_c
+        actual_tp   = qty * abs(sig["tp"] - sig["entry"])
 
         log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{sig['tf']}] ***")
-        log.info(f"  Entry     : {sig['entry']:,.{dp}f}")
-        log.info(f"  Stop Loss : {sig['sl']:,.{dp}f}")
-        log.info(f"  Take Prof : {sig['tp']:,.{dp}f}")
-        log.info(f"  Risk      : â‚¹{actual_risk:.0f} ({actual_risk/balance*100:.2f}%)")
-        log.info(f"  Contracts : {qty}")
+        log.info(f"  Entry      : {sig['entry']:,.{dp}f}")
+        log.info(f"  Stop Loss  : {sig['sl']:,.{dp}f}")
+        log.info(f"  Take Profit: {sig['tp']:,.{dp}f}  (1:{int(RR_RATIO)} RR)")
+        log.info(f"  Trail SL   : activates after +"
+                 f"{sig['risk']*TRAIL_TRIGGER:.{dp}f} points profit")
+        log.info(f"  Trail dist : {int(TRAIL_DISTANCE*100)}% of move"
+                 f" (not too tight)")
+        log.info(f"  Risk       : Rs.{actual_risk:.0f} "
+                 f"({actual_risk/balance*100:.2f}%)")
+        log.info(f"  Reward     : Rs.{actual_tp:.0f}")
+        log.info(f"  Contracts  : {qty}")
 
         success = place_order_with_sl_tp(pid, sig, qty, asset)
         if success:
             trades_placed += 1
             total_risk    += actual_risk
-
         break
 
     log.info(f"\n{'='*65}")
-    log.info(f"Summary: trades={trades_placed} | risk=â‚¹{total_risk:.0f} | balance=â‚¹{balance:,.0f}")
+    log.info(f"Summary: trades={trades_placed} | "
+             f"risk=Rs.{total_risk:.0f} | balance=Rs.{balance:,.0f}")
     log.info("Run complete.")
 
 
