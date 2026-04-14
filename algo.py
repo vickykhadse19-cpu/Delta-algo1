@@ -1,33 +1,13 @@
 """
-Delta Exchange India — BTC + ETH Pro Algo v8
-============================================
-KEY FIX: Uses BOTH 4H and 1H S/R levels
-  4H levels = strong zones from big moves
-  1H levels = recent zones near current price
-  
-This means algo always has levels close to price
-and fires signals much faster.
-
-Entry:
-  S/R level (4H strong OR 1H recent)
-  15M candle breaks level with strong body
-  5M candle confirms (5-10 min entry)
-  Volume filter on strong signals
-  4H trend alignment
-
-Exit:
-  Strong 4H level  → 1:8 RR
-  Normal 4H level  → 1:6 RR
-  1H level         → 1:5 RR (smaller move expected)
-  Trailing stop 35% of move, starts at 1.5x risk
+Delta Exchange India — BTC + ETH Pro Algo v8 Fixed
+===================================================
+FIXED: Removed bracket order — uses simple entry + SL + TP
+       This is the same method that worked for BTC/ETH LONG trades
 """
 
 import os, time, hmac, hashlib, json, requests, logging
 from datetime import datetime, timezone
 
-# ─────────────────────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────────────────────
 API_KEY    = os.environ.get("DELTA_API_KEY",    "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
 BASE_URL   = "https://api.india.delta.exchange"
@@ -37,21 +17,14 @@ ASSETS = {
     "ETH": {"symbol": "ETHUSD", "product_id": None},
 }
 
-# Risk
 RISK_NORMAL    = 1.5
 RISK_STRONG    = 2.0
 MAX_TOTAL_RISK = 3.0
-
-# RR based on signal type
-RR_STRONG_4H   = 8.0   # 4H strong level + volume + trend
-RR_NORMAL_4H   = 6.0   # 4H normal level
-RR_1H          = 5.0   # 1H level (smaller expected move)
-
-# Trailing
+RR_STRONG_4H   = 8.0
+RR_NORMAL_4H   = 6.0
+RR_1H          = 5.0
 TRAIL_TRIGGER  = 1.5
 TRAIL_DISTANCE = 0.35
-
-# Filters
 SR_LOOKBACK       = 5
 SR_CLUSTER_TOL    = 0.003
 MIN_BREAK_PCT     = 0.0005
@@ -71,9 +44,6 @@ logging.basicConfig(
 log = logging.getLogger("delta_v8")
 
 
-# ─────────────────────────────────────────────────────────────
-#  AUTH
-# ─────────────────────────────────────────────────────────────
 def auth_headers(method, path, qs="", body=""):
     ts  = str(int(time.time()))
     msg = method + ts + path + ("?" + qs if qs else "") + body
@@ -107,9 +77,6 @@ def api_put(path, payload):
     return r.json()
 
 
-# ─────────────────────────────────────────────────────────────
-#  MARKET DATA
-# ─────────────────────────────────────────────────────────────
 def get_product_id(symbol):
     try:
         r = requests.get(
@@ -183,9 +150,6 @@ def get_open_orders(product_id):
         return []
 
 
-# ─────────────────────────────────────────────────────────────
-#  S/R DETECTION
-# ─────────────────────────────────────────────────────────────
 def detect_sr_levels(candles, label=""):
     raw, n, lb = [], len(candles), SR_LOOKBACK
     for i in range(lb, n - lb):
@@ -194,7 +158,6 @@ def detect_sr_levels(candles, label=""):
             raw.append({"price": c["high"], "type": "R"})
         if all(candles[j]["low"] > c["low"] for j in range(i-lb, i+lb+1) if j != i):
             raw.append({"price": c["low"], "type": "S"})
-
     used, out = set(), []
     for i, a in enumerate(raw):
         if i in used: continue
@@ -212,42 +175,22 @@ def detect_sr_levels(candles, label=""):
 
 
 def merge_sr_levels(sr_4h, sr_1h, px):
-    """
-    Combine 4H and 1H levels.
-    Remove duplicates within 0.3% of each other.
-    Keep 4H levels as higher priority.
-    Only keep levels within 8% of current price.
-    """
     all_levels = []
-
-    # Add 4H levels first (higher priority)
     for l in sr_4h:
-        dist = abs(l["price"] - px) / px
-        if dist <= 0.08:  # within 8%
+        if abs(l["price"] - px) / px <= 0.08:
             all_levels.append(l)
-
-    # Add 1H levels — skip if too close to existing 4H level
     for l in sr_1h:
-        dist = abs(l["price"] - px) / px
-        if dist > 0.06:  # only within 6% for 1H
+        if abs(l["price"] - px) / px > 0.06:
             continue
-        # Check not duplicate of 4H level
-        is_dup = any(
-            abs(l["price"] - e["price"]) / e["price"] < SR_CLUSTER_TOL
-            for e in all_levels
-        )
+        is_dup = any(abs(l["price"] - e["price"]) / e["price"] < SR_CLUSTER_TOL
+                     for e in all_levels)
         if not is_dup:
             all_levels.append(l)
-
     return sorted(all_levels, key=lambda x: -x["strength"])
 
 
-# ─────────────────────────────────────────────────────────────
-#  4H TREND
-# ─────────────────────────────────────────────────────────────
 def get_4h_trend(c4h):
-    if len(c4h) < 4:
-        return "NEUTRAL"
+    if len(c4h) < 4: return "NEUTRAL"
     last3   = c4h[-3:]
     bullish = sum(1 for c in last3 if c["close"] > c["open"])
     bearish = sum(1 for c in last3 if c["close"] < c["open"])
@@ -256,9 +199,6 @@ def get_4h_trend(c4h):
     return "NEUTRAL"
 
 
-# ─────────────────────────────────────────────────────────────
-#  SIGNAL DETECTION  (4H + 1H levels, 15M + 5M entry)
-# ─────────────────────────────────────────────────────────────
 def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
     if len(c15m) < 2 or len(c5m) < 2 or not sr_combined:
         return None
@@ -288,7 +228,6 @@ def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
         else:
             return RR_1H, RISK_NORMAL, "NORMAL 1H"
 
-    # ── LONG ─────────────────────────────────────────────────
     if trend != "BEAR":
         resistances = sorted(
             [l for l in sr_combined if l["type"] == "R" and l["price"] > px * 0.99],
@@ -299,7 +238,6 @@ def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
             brk   = (c15_curr["close"] - level) / level
             if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT): continue
             if body_pct(c15_curr) < MIN_BODY_PCT: continue
-
             if c5_curr["close"] > level * 1.0002:
                 entry = c5_curr["close"]
                 sl    = min(level * 0.997, c15_curr["low"], c5_curr["low"])
@@ -311,20 +249,16 @@ def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
                     "tp": entry + risk * rr, "level": level,
                     "risk": risk, "rr": rr, "risk_pct": rsk,
                     "confirmed": True, "grade": grade,
-                    "tf": f"4H_SR+1H_SR+15M+5M",
-                    "level_tf": res["tf"],
-                    "strength": res["strength"],
-                    "vol": f"{'HIGH' if high_vol else 'normal'}",
-                    "trend": trend,
+                    "level_tf": res["tf"], "strength": res["strength"],
+                    "vol": "HIGH" if high_vol else "normal", "trend": trend,
                 }
             else:
                 return {
                     "dir": "LONG", "confirmed": False, "level": level,
                     "level_tf": res["tf"],
-                    "msg": f"15M broke {level:.1f} ({res['tf']}) — waiting 5M",
+                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
                 }
 
-    # ── SHORT ────────────────────────────────────────────────
     if trend != "BULL":
         supports = sorted(
             [l for l in sr_combined if l["type"] == "S" and l["price"] < px * 1.01],
@@ -335,7 +269,6 @@ def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
             brk   = (level - c15_curr["close"]) / level
             if not (MIN_BREAK_PCT < brk < MAX_BREAK_PCT): continue
             if body_pct(c15_curr) < MIN_BODY_PCT: continue
-
             if c5_curr["close"] < level * 0.9998:
                 entry = c5_curr["close"]
                 sl    = max(level * 1.003, c15_curr["high"], c5_curr["high"])
@@ -347,25 +280,18 @@ def detect_signal(c4h, c1h, c15m, c5m, sr_combined):
                     "tp": entry - risk * rr, "level": level,
                     "risk": risk, "rr": rr, "risk_pct": rsk,
                     "confirmed": True, "grade": grade,
-                    "tf": f"4H_SR+1H_SR+15M+5M",
-                    "level_tf": sup["tf"],
-                    "strength": sup["strength"],
-                    "vol": f"{'HIGH' if high_vol else 'normal'}",
-                    "trend": trend,
+                    "level_tf": sup["tf"], "strength": sup["strength"],
+                    "vol": "HIGH" if high_vol else "normal", "trend": trend,
                 }
             else:
                 return {
                     "dir": "SHORT", "confirmed": False, "level": level,
                     "level_tf": sup["tf"],
-                    "msg": f"15M broke {level:.1f} ({sup['tf']}) — waiting 5M",
+                    "msg": f"15M broke {level:.1f} — waiting 5M confirm",
                 }
-
     return None
 
 
-# ─────────────────────────────────────────────────────────────
-#  TRAILING STOP
-# ─────────────────────────────────────────────────────────────
 def calculate_trail_sl(direction, entry, current_sl, orig_risk, px):
     if direction == "LONG":
         if px - entry < orig_risk * TRAIL_TRIGGER: return None
@@ -424,6 +350,10 @@ def manage_open_positions(open_positions, c5m_by_asset):
 
 # ─────────────────────────────────────────────────────────────
 #  ORDER PLACEMENT
+#  Step 1: Market entry order
+#  Step 2: Stop Loss order  (placed 2 sec after entry fills)
+#  Step 3: Take Profit order
+#  This is the SAME method that worked for previous BTC/ETH trades
 # ─────────────────────────────────────────────────────────────
 def place_order(product_id, sig, qty, symbol):
     side     = "buy"  if sig["dir"] == "LONG"  else "sell"
@@ -431,78 +361,87 @@ def place_order(product_id, sig, qty, symbol):
     sl_price = round(sig["sl"], 2)
     tp_price = round(sig["tp"], 2)
     dp       = 1 if sig["entry"] > 1000 else 2
-    sl_off   = -0.5 if sig["dir"] == "LONG" else 0.5
-    tp_off   =  0.5 if sig["dir"] == "LONG" else -0.5
 
     if DRY_RUN:
-        log.info(f"  [DRY RUN] {symbol} {sig['dir']} | "
-                 f"Entry={sig['entry']:.{dp}f} | SL={sl_price} | "
-                 f"TP={tp_price} | RR=1:{int(sig['rr'])}")
-        return True
-
-    try:
-        r = api_post("/v2/orders", {
-            "product_id":                      product_id,
-            "size":                            qty,
-            "side":                            side,
-            "order_type":                      "market_order",
-            "time_in_force":                   "gtc",
-            "bracket_stop_loss_price":         str(round(sl_price + sl_off, 2)),
-            "bracket_stop_loss_limit_price":   str(sl_price),
-            "bracket_take_profit_price":       str(round(tp_price + tp_off, 2)),
-            "bracket_take_profit_limit_price": str(tp_price),
-        })
-        res = r.get("result", {})
-        log.info(f"  Bracket OK! ID={res.get('id','?')}")
+        log.info(f"  [DRY RUN] {symbol} {sig['dir']}")
         log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | "
                  f"TP={tp_price} | RR=1:{int(sig['rr'])}")
+        log.info(f"  SL and TP will be set automatically after entry fills")
         return True
-    except requests.HTTPError:
-        log.warning(f"  Bracket failed — fallback...")
 
     try:
-        er = api_post("/v2/orders", {
-            "product_id": product_id, "size": qty,
-            "side": side, "order_type": "market_order",
+        # Step 1 — Entry order
+        entry_resp = api_post("/v2/orders", {
+            "product_id":    product_id,
+            "size":          qty,
+            "side":          side,
+            "order_type":    "market_order",
             "time_in_force": "gtc",
         })
-        log.info(f"  Entry OK! ID={er.get('result',{}).get('id','?')}")
-        time.sleep(2)
-        api_post("/v2/orders", {
-            "product_id": product_id, "size": qty, "side": close,
-            "order_type": "stop_market_order", "time_in_force": "gtc",
-            "stop_price": str(sl_price), "close_on_trigger": True,
+        order_id = entry_resp.get("result", {}).get("id", "?")
+        log.info(f"  ✅ Entry placed! ID={order_id}")
+        log.info(f"  Entry={sig['entry']:.{dp}f}")
+
+        # Wait for entry to fill
+        time.sleep(3)
+
+        # Step 2 — Stop Loss order
+        sl_resp = api_post("/v2/orders", {
+            "product_id":       product_id,
+            "size":             qty,
+            "side":             close,
+            "order_type":       "stop_market_order",
+            "time_in_force":    "gtc",
+            "stop_price":       str(sl_price),
+            "close_on_trigger": True,
         })
-        api_post("/v2/orders", {
-            "product_id": product_id, "size": qty, "side": close,
-            "order_type": "take_profit_market_order", "time_in_force": "gtc",
-            "stop_price": str(tp_price), "close_on_trigger": True,
+        log.info(f"  ✅ Stop Loss set at {sl_price}")
+
+        # Step 3 — Take Profit order
+        tp_resp = api_post("/v2/orders", {
+            "product_id":       product_id,
+            "size":             qty,
+            "side":             close,
+            "order_type":       "take_profit_market_order",
+            "time_in_force":    "gtc",
+            "stop_price":       str(tp_price),
+            "close_on_trigger": True,
         })
-        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl_price} | TP={tp_price}")
+        log.info(f"  ✅ Take Profit set at {tp_price}")
+        log.info(f"  ══════════════════════════════════════")
+        log.info(f"  {sig['dir']} {symbol} ORDER COMPLETE")
+        log.info(f"  Entry : {sig['entry']:.{dp}f}")
+        log.info(f"  SL    : {sl_price}  ← auto closes if loss")
+        log.info(f"  TP    : {tp_price}  ← auto closes if profit")
+        log.info(f"  RR    : 1:{int(sig['rr'])}")
+        log.info(f"  ══════════════════════════════════════")
         return True
+
+    except requests.HTTPError as e:
+        err = e.response.text if e.response else str(e)
+        log.error(f"  ❌ Order failed: {err}")
+        log.error(f"  SET MANUALLY on Delta Exchange app:")
+        log.error(f"  Direction : {sig['dir']}")
+        log.error(f"  SL        : {sl_price}")
+        log.error(f"  TP        : {tp_price}")
+        return False
     except Exception as e:
-        log.error(f"  All failed: {e}")
-        log.error(f"  MANUAL: SL={sl_price} TP={tp_price}")
+        log.error(f"  ❌ Error: {e}")
+        log.error(f"  SET MANUALLY — SL={sl_price}  TP={tp_price}")
         return False
 
 
-# ─────────────────────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────────────────────
 def run():
     log.info("=" * 65)
     log.info(f"Delta Pro v8 | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     log.info(f"DRY_RUN={DRY_RUN} | BTC+ETH | "
-             f"Risk={RISK_NORMAL}-{RISK_STRONG}% | "
-             f"RR=1:5/1:6/1:8 | Trail@35% | "
-             f"4H+1H levels | 15M+5M entry")
+             f"RR=1:5/1:6/1:8 | Trail@35% | 4H+1H levels | 15M+5M entry")
     log.info("=" * 65)
 
     if not API_KEY or not API_SECRET:
         log.error("API keys not set.")
         return
 
-    # Product IDs
     log.info("Resolving product IDs...")
     for asset, cfg in ASSETS.items():
         pid = get_product_id(cfg["symbol"])
@@ -512,7 +451,6 @@ def run():
         else:
             log.warning(f"  {asset}: not found")
 
-    # Balance
     if DRY_RUN:
         balance = 25000.0
         log.info(f"[DRY RUN] Mock balance = Rs.{balance:,.0f}")
@@ -528,7 +466,6 @@ def run():
             balance = raw_bal
             log.info(f"  Live balance: Rs.{balance:,.0f}")
 
-    # Fetch candles
     c4h_by  = {}
     c1h_by  = {}
     c15m_by = {}
@@ -542,13 +479,11 @@ def run():
         except Exception as e:
             log.error(f"  Candle error {asset}: {e}")
 
-    # Manage open positions
     if not DRY_RUN:
         open_pos = get_open_positions()
         if open_pos:
             manage_open_positions(open_pos, c5m_by)
 
-    # Scan for signals
     trades_placed = 0
     total_risk    = 0.0
 
@@ -587,14 +522,13 @@ def run():
         log.info(f"  Candles  : {len(c4h)}x4H | {len(c1h)}x1H | "
                  f"{len(c15m)}x15M | {len(c5m)}x5M")
 
-        # Build S/R from BOTH 4H and 1H
         sr_4h = detect_sr_levels(c4h, "4H")
         sr_1h = detect_sr_levels(c1h, "1H")
         sr    = merge_sr_levels(sr_4h, sr_1h, px)
 
-        log.info(f"  S/R levels: {len([l for l in sr if l['tf']=='4H'])} from 4H "
+        log.info(f"  S/R: {len([l for l in sr if l['tf']=='4H'])} from 4H "
                  f"+ {len([l for l in sr if l['tf']=='1H'])} from 1H "
-                 f"= {len(sr)} total near price")
+                 f"= {len(sr)} total")
 
         for lv in sr[:8]:
             dist = (lv['price'] - px) / px * 100
@@ -605,7 +539,7 @@ def run():
         sig = detect_signal(c4h, c1h, c15m, c5m, sr)
 
         if not sig:
-            log.info(f"  No signal — no level being tested right now.")
+            log.info(f"  No signal.")
             continue
 
         if not sig["confirmed"]:
@@ -613,7 +547,6 @@ def run():
                      f"{sig['level']:,.{dp}f} — {sig.get('msg','...')}")
             continue
 
-        # Place trade
         risk_budget = balance * sig["risk_pct"] / 100
         risk_per_c  = abs(sig["entry"] - sig["sl"])
         qty         = max(1, int(risk_budget / risk_per_c)) if risk_per_c > 0 else 1
@@ -621,13 +554,13 @@ def run():
         actual_tp   = qty * abs(sig["tp"] - sig["entry"])
 
         log.info(f"\n  *** SIGNAL: {sig['dir']} {asset} [{sig['grade']}] ***")
-        log.info(f"  Level TF   : {sig['level_tf']} level at {sig['level']:,.{dp}f}")
+        log.info(f"  Level TF   : {sig['level_tf']} at {sig['level']:,.{dp}f}")
         log.info(f"  4H Trend   : {sig['trend']}")
         log.info(f"  Volume     : {sig['vol']}")
         log.info(f"  Entry      : {sig['entry']:,.{dp}f}")
-        log.info(f"  Stop Loss  : {sig['sl']:,.{dp}f}")
-        log.info(f"  Take Profit: {sig['tp']:,.{dp}f}  (1:{int(sig['rr'])} RR)")
-        log.info(f"  Risk       : Rs.{actual_risk:.0f} ({sig['risk_pct']}%)")
+        log.info(f"  Stop Loss  : {round(sig['sl'],2)}  ← set automatically")
+        log.info(f"  Take Profit: {round(sig['tp'],2)}  ← set automatically  (1:{int(sig['rr'])} RR)")
+        log.info(f"  Risk       : Rs.{actual_risk:.0f}")
         log.info(f"  Reward     : Rs.{actual_tp:.0f}")
         log.info(f"  Contracts  : {qty}")
 
