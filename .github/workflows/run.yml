@@ -2,7 +2,7 @@ name: Delta Exchange Algo — Auto Trade
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"   # every 15 min — stays within free 2000 min/month
   workflow_dispatch:
     inputs:
       dry_run:
@@ -16,7 +16,7 @@ env:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
 
     steps:
       - name: Checkout code
