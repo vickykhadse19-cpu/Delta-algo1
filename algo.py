@@ -347,49 +347,276 @@ def manage_open_positions(open_positions, c5m_by):
             log.warning(f"  Manage error: {e}")
 
 
+def set_position_sltp(product_id, sl_price, tp_price):
+    """
+    Set SL and TP directly on the open position.
+    Delta Exchange India supports this via position update.
+    This is different from placing separate orders.
+    """
+    try:
+        payload = {
+            "product_id":        product_id,
+            "stop_loss_price":   str(sl_price),
+            "take_profit_price": str(tp_price),
+        }
+        r = requests.put(
+            f"{BASE_URL}/v2/positions",
+            headers=auth_headers("PUT", "/v2/positions", "",
+                                 json.dumps(payload, separators=(",", ":"))),
+            data=json.dumps(payload, separators=(",", ":")),
+            timeout=15
+        )
+        r.raise_for_status()
+        log.info(f"  ✅ SL={sl_price} TP={tp_price} set on position directly")
+        return True
+    except Exception as e:
+        log.warning(f"  Position SL/TP failed: {e}")
+        return False
+
+
+def set_sltp_via_orders(product_id, sig, qty):
+    """
+    Fallback: place SL and TP as separate orders.
+    Tries multiple order type formats for Delta India.
+    """
+    side  = "sell" if sig["dir"] == "LONG" else "buy"
+    sl    = sig["sl"]
+    tp    = sig["tp"]
+
+    # Try SL order — Delta India uses "stop_loss_order"
+    sl_success = False
+    for sl_type in ["stop_loss_order", "stop_market_order", "stop_order"]:
+        try:
+            api_post("/v2/orders", {
+                "product_id":       product_id,
+                "size":             qty,
+                "side":             side,
+                "order_type":       sl_type,
+                "time_in_force":    "gtc",
+                "stop_price":       str(sl),
+                "close_on_trigger": True,
+            })
+            log.info(f"  ✅ SL={sl} (via {sl_type})")
+            sl_success = True
+            break
+        except Exception:
+            continue
+
+    if not sl_success:
+        log.warning(f"  SL order failed — trying limit SL")
+        try:
+            api_post("/v2/orders", {
+                "product_id":    product_id,
+                "size":          qty,
+                "side":          side,
+                "order_type":    "limit_order",
+                "time_in_force": "gtc",
+                "limit_price":   str(sl),
+            })
+            log.info(f"  ✅ SL={sl} (limit order)")
+            sl_success = True
+        except Exception as e:
+            log.error(f"  ❌ All SL methods failed: {e}")
+
+    # Try TP order
+    tp_success = False
+    for tp_type in ["take_profit_order", "take_profit_market_order", "limit_order"]:
+        try:
+            payload = {
+                "product_id":       product_id,
+                "size":             qty,
+                "side":             side,
+                "order_type":       tp_type,
+                "time_in_force":    "gtc",
+                "stop_price":       str(tp),
+                "close_on_trigger": True,
+            }
+            if tp_type == "limit_order":
+                payload = {
+                    "product_id":    product_id,
+                    "size":          qty,
+                    "side":          side,
+                    "order_type":    "limit_order",
+                    "time_in_force": "gtc",
+                    "limit_price":   str(tp),
+                }
+            api_post("/v2/orders", payload)
+            log.info(f"  ✅ TP={tp} (via {tp_type})")
+            tp_success = True
+            break
+        except Exception:
+            continue
+
+    if not tp_success:
+        log.error(f"  ❌ All TP methods failed")
+
+    return sl_success and tp_success
+
+
+def get_actual_entry_price(product_id):
+    """Get actual fill price from open position."""
+    try:
+        data = api_get("/v2/positions", {"product_id": product_id})
+        pos  = data.get("result", {})
+        if isinstance(pos, list):
+            pos = pos[0] if pos else {}
+        entry = float(pos.get("entry_price", 0) or 0)
+        size  = float(pos.get("size", 0) or 0)
+        return entry if size != 0 else 0
+    except Exception:
+        return 0
+
+
+def place_sl_order(product_id, qty, side, sl_price):
+    """Try multiple order types for Stop Loss."""
+    # Delta Exchange India supports these stop order types
+    for order_type in ["stop_market_order", "stop_order"]:
+        for trigger_field in [
+            {"close_on_trigger": True},
+            {"reduce_only": True},
+            {}
+        ]:
+            try:
+                payload = {
+                    "product_id":    product_id,
+                    "size":          qty,
+                    "side":          side,
+                    "order_type":    order_type,
+                    "time_in_force": "gtc",
+                    "stop_price":    str(sl_price),
+                }
+                payload.update(trigger_field)
+                resp = api_post("/v2/orders", payload)
+                log.info(f"  ✅ SL set at {sl_price} "
+                         f"(type={order_type})")
+                return True
+            except requests.HTTPError as e:
+                err = e.response.text if e.response else str(e)
+                log.debug(f"  SL attempt {order_type}: {err[:80]}")
+                continue
+            except Exception as e:
+                log.debug(f"  SL attempt {order_type}: {e}")
+                continue
+    return False
+
+
+def place_tp_order(product_id, qty, side, tp_price):
+    """Try multiple order types for Take Profit."""
+    for order_type in ["take_profit_market_order", "take_profit_order"]:
+        for trigger_field in [
+            {"close_on_trigger": True},
+            {"reduce_only": True},
+            {}
+        ]:
+            try:
+                payload = {
+                    "product_id":    product_id,
+                    "size":          qty,
+                    "side":          side,
+                    "order_type":    order_type,
+                    "time_in_force": "gtc",
+                    "stop_price":    str(tp_price),
+                }
+                payload.update(trigger_field)
+                resp = api_post("/v2/orders", payload)
+                log.info(f"  ✅ TP set at {tp_price} "
+                         f"(type={order_type})")
+                return True
+            except requests.HTTPError as e:
+                err = e.response.text if e.response else str(e)
+                log.debug(f"  TP attempt {order_type}: {err[:80]}")
+                continue
+            except Exception as e:
+                log.debug(f"  TP attempt {order_type}: {e}")
+                continue
+    return False
+
+
 def place_order(product_id, sig, qty, symbol):
     side  = "buy"  if sig["dir"] == "LONG" else "sell"
     close = "sell" if sig["dir"] == "LONG" else "buy"
-    sl    = sig["sl"]
-    tp    = sig["tp"]
     dp    = 1 if sig["entry"] > 1000 else 2
 
     if DRY_RUN:
         log.info(f"  [DRY RUN] {symbol} {sig['dir']}")
-        log.info(f"  Entry={sig['entry']:.{dp}f} | SL={sl} | TP={tp} | RR=1:{int(RR_RATIO)}")
+        log.info(f"  Entry={sig['entry']:.{dp}f} | "
+                 f"SL={sig['sl']} | TP={sig['tp']} | "
+                 f"RR=1:{int(RR_RATIO)}")
         return True
 
+    # ── Step 1: Entry order ───────────────────────────────────
     try:
         er = api_post("/v2/orders", {
-            "product_id": product_id, "size": qty,
-            "side": side, "order_type": "market_order", "time_in_force": "gtc",
+            "product_id":    product_id,
+            "size":          qty,
+            "side":          side,
+            "order_type":    "market_order",
+            "time_in_force": "gtc",
         })
-        log.info(f"  ✅ Entry! ID={er.get('result',{}).get('id','?')}")
-        time.sleep(3)
-
-        api_post("/v2/orders", {
-            "product_id": product_id, "size": qty, "side": close,
-            "order_type": "stop_market_order", "time_in_force": "gtc",
-            "stop_price": str(sl), "close_on_trigger": True,
-        })
-        log.info(f"  ✅ SL={sl}")
-
-        api_post("/v2/orders", {
-            "product_id": product_id, "size": qty, "side": close,
-            "order_type": "take_profit_market_order", "time_in_force": "gtc",
-            "stop_price": str(tp), "close_on_trigger": True,
-        })
-        log.info(f"  ✅ TP={tp}")
-        log.info(f"  {sig['dir']} {symbol} | Entry={sig['entry']:.{dp}f} | SL={sl} | TP={tp} | RR=1:{int(RR_RATIO)}")
-        return True
+        order_id = er.get("result", {}).get("id", "?")
+        log.info(f"  ✅ Entry placed! ID={order_id}")
     except requests.HTTPError as e:
         err = e.response.text if e.response else str(e)
-        log.error(f"  Failed: {err}")
-        log.error(f"  MANUAL: SL={sl} TP={tp}")
+        log.error(f"  ❌ Entry failed: {err}")
         return False
-    except Exception as e:
-        log.error(f"  Error: {e}")
-        return False
+
+    # Wait for fill
+    time.sleep(4)
+
+    # ── Step 2: Get actual fill price ─────────────────────────
+    actual_entry = get_actual_entry_price(product_id)
+    if actual_entry > 0:
+        log.info(f"  Filled at: {actual_entry:.{dp}f}")
+        # Recalculate SL/TP based on actual fill
+        actual_risk = abs(actual_entry - sig["sl"])
+        if sig["dir"] == "LONG":
+            sl_price = round(actual_entry - actual_risk, 2)
+            tp_price = round(actual_entry + actual_risk * RR_RATIO, 2)
+        else:
+            sl_price = round(actual_entry + actual_risk, 2)
+            tp_price = round(actual_entry - actual_risk * RR_RATIO, 2)
+    else:
+        # Fallback to signal price
+        sl_price = sig["sl"]
+        tp_price = sig["tp"]
+        log.info(f"  Using signal prices for SL/TP")
+
+    log.info(f"  Placing SL at {sl_price}...")
+    log.info(f"  Placing TP at {tp_price}...")
+
+    # ── Step 3: Stop Loss ─────────────────────────────────────
+    sl_ok = place_sl_order(product_id, qty, close, sl_price)
+
+    # ── Step 4: Take Profit ───────────────────────────────────
+    tp_ok = place_tp_order(product_id, qty, close, tp_price)
+
+    # ── Summary ───────────────────────────────────────────────
+    log.info(f"  ══════════════════════════════════════")
+    log.info(f"  {sig['dir']} {symbol}")
+    log.info(f"  Entry : {actual_entry if actual_entry > 0 else sig['entry']:.{dp}f}")
+
+    if sl_ok:
+        log.info(f"  SL    : {sl_price}  ✅ ACTIVE on exchange")
+    else:
+        log.warning(f"  SL    : {sl_price}  ⚠️  ADD MANUALLY on app")
+
+    if tp_ok:
+        log.info(f"  TP    : {tp_price}  ✅ ACTIVE on exchange")
+    else:
+        log.warning(f"  TP    : {tp_price}  ⚠️  ADD MANUALLY on app")
+
+    log.info(f"  RR    : 1:{int(RR_RATIO)}")
+    log.info(f"  ══════════════════════════════════════")
+
+    if not sl_ok or not tp_ok:
+        log.warning(f"")
+        log.warning(f"  ⚠️  IMPORTANT — SET THESE ON DELTA APP:")
+        log.warning(f"  Go to Positions → tap {symbol} → Add SL/TP")
+        log.warning(f"  SL = {sl_price}")
+        log.warning(f"  TP = {tp_price}")
+        log.warning(f"")
+
+    return True
 
 
 def run():
