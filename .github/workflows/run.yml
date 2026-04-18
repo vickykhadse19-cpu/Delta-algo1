@@ -1,38 +1,41 @@
-name: Delta Exchange Algo — Auto Trade
+name: Delta Algo v12
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 min — stays within free 2000 min/month
-  workflow_dispatch:
+    - cron: "0 */2 * * 1-5"   # Har 2 ghante, Mon-Fri
+  workflow_dispatch:            # Manual run bhi kar sakte ho
     inputs:
-      dry_run:
-        description: "Dry run? (true/false)"
-        required: false
-        default: "false"
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      mode:
+        description: "Mode"
+        default: "live"
+        type: choice
+        options: [live, dry-run, status]
 
 jobs:
-  trade:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install requests
+      - run: pip install requests
 
-      - name: Run trading algo
+      - name: Run algo
         env:
           DELTA_API_KEY:    ${{ secrets.DELTA_API_KEY }}
           DELTA_API_SECRET: ${{ secrets.DELTA_API_SECRET }}
-          DRY_RUN:          ${{ github.event.inputs.dry_run || 'false' }}
-        run: python algo.py
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.mode }}" = "dry-run" ]; then
+              python algo.py --dry-run
+            elif [ "${{ github.event.inputs.mode }}" = "status" ]; then
+              python algo.py --status
+            else
+              python algo.py
+            fi
+          else
+            python algo.py
+          fi
