@@ -1,25 +1,25 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║  DELTA EXCHANGE INDIA — ALGO v12                                ║
-║  Strategy : RSI Pullback in EMA Trend (BTC + ETH Futures)      ║
-║  Capital  : ₹50,000                                            ║
-║  Monthly  : ₹1,500–2,000 average (realistic)                   ║
+║  Strategy : RSI Pullback in EMA Trend (ETH Futures only)       ║
+║  Capital  : ₹9,000                                             ║
+║  Monthly  : ₹270–360 average (realistic)                       ║
 ║  SL/TP    : 100% AUTO — no manual action needed                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 USAGE:
-  python algo.py            → Live trading
-  python algo.py --dry-run  → Test mode (no real orders)
-  python algo.py --status   → Show open positions + P&L
+  python algo_eth.py            → Live trading
+  python algo_eth.py --dry-run  → Test mode (no real orders)
+  python algo_eth.py --status   → Show open positions + P&L
 """
 
 import hmac, hashlib, time, json, logging, os, sys, requests
 from datetime import datetime
 
 # ── SETTINGS — change these only ──────────────────────────────────
-CAPITAL      = 50000        # Your total capital in INR
-RISK_PCT     = 1.0          # Risk per trade = 1% of capital = Rs 500
-RR_RATIO     = 3.0          # Take profit = 3x stop loss distance
+CAPITAL      = 9000         # Your total capital in INR
+RISK_PCT     = 3.0          # Risk per trade = 3% of capital = Rs 270
+RR_RATIO     = 4.0          # Take profit = 4x stop loss distance
 ATR_MULT     = 1.5          # Stop loss = 1.5 x ATR from entry
 MAX_HOLD_H   = 72           # Auto-close trade after 72 hours
 DRY_RUN      = "--dry-run" in sys.argv
@@ -29,9 +29,8 @@ API_KEY    = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
 BASE       = "https://api.india.delta.exchange"
 
-# ── Products ───────────────────────────────────────────────────────
+# ── Products — ETH only ────────────────────────────────────────────
 ASSETS = [
-    {"symbol": "BTCUSD", "product_id": 27,   "name": "BTC"},
     {"symbol": "ETHUSD", "product_id": 3136, "name": "ETH"},
 ]
 
@@ -184,13 +183,11 @@ def auto_sl(product_id, side, qty, sl_price, atr):
         log.info(f"  [DRY] SL {side} {qty} @ {sl_price:.1f}"); return True
 
     attempts = [
-        # (order_type, has_limit_price)
         ("stop_loss_order",   True),
         ("stop_loss_order",   False),
         ("stop_market_order", False),
         ("stop_market_order", True),
     ]
-    # Try 4 price rounding variants × 4 order types = 16 attempts
     for price_variant in [round(sl_price,1), round(sl_price,0), round(sl_price/5)*5, round(sl_price/10)*10]:
         for otype, with_limit in attempts:
             payload = {
@@ -201,7 +198,6 @@ def auto_sl(product_id, side, qty, sl_price, atr):
                 "stop_price": str(price_variant),
             }
             if with_limit:
-                # Limit slightly beyond stop so it fills
                 if side == "sell":
                     payload["limit_price"] = str(round(price_variant * 0.997, 1))
                 else:
@@ -260,7 +256,6 @@ def execute_trade(asset, signal, balance):
     log.info(f"  RR     : 1:{RR_RATIO}  |  RSI: {signal['rsi']:.0f}  |  ATR: {signal['atr']:.0f}")
     log.info(f"{'─'*52}")
 
-    # Cancel stale orders
     for o in get_open_orders(pid):
         api_delete("/v2/orders", {"id": o.get("id"), "product_id": pid})
 
@@ -268,17 +263,14 @@ def execute_trade(asset, signal, balance):
         log.info("  [DRY RUN] No real order placed")
         return
 
-    # 1. Entry
     entry = api_post("/v2/orders", {"product_id":pid,"side":direction,"order_type":"market_order","size":qty})
     if not entry.get("result"):
         log.error("  Entry failed"); return
     log.info(f"  Entry order placed | ID:{entry['result'].get('id','?')}")
 
-    # 2. Wait for fill → get actual fill price
     fill = get_fill_price(pid)
     if fill > 0 and fill != signal["price"]:
         log.info(f"  Actual fill: ${fill:,.1f} (vs signal ${signal['price']:,.1f})")
-        # Recalculate SL/TP from actual fill
         if direction == "buy":
             signal["sl"] = round(fill - ATR_MULT * signal["atr"], 1)
             signal["tp"] = round(fill + abs(fill - signal["sl"]) * RR_RATIO, 1)
@@ -287,13 +279,9 @@ def execute_trade(asset, signal, balance):
             signal["tp"] = round(fill - abs(signal["sl"] - fill) * RR_RATIO, 1)
         log.info(f"  Adjusted  → SL:{signal['sl']:.1f}  TP:{signal['tp']:.1f}")
 
-    # 3. Auto SL (16 attempts, guaranteed)
     sl_ok = auto_sl(pid, close_side, qty, signal["sl"], signal["atr"])
-
-    # 4. Auto TP (4 attempts)
     tp_ok = auto_tp(pid, close_side, qty, signal["tp"])
 
-    # 5. Result
     if sl_ok and tp_ok:
         log.info("  STATUS: FULLY AUTOMATIC — SL + TP both placed")
     else:
@@ -342,7 +330,7 @@ def manage_positions():
 
 def show_status():
     log.info("\n" + "═"*52)
-    log.info("  ACCOUNT STATUS")
+    log.info("  ACCOUNT STATUS  (ETH only)")
     log.info("═"*52)
     balance = get_balance()
     log.info(f"  Balance : Rs{balance:,.0f}")
@@ -358,10 +346,10 @@ def show_status():
             log.info(f"  {'LONG' if size>0 else 'SHORT'} {abs(size)}x {sym} @ ${ep:,.1f} | PnL: {pnl:+.2f}")
     else:
         log.info("  No open positions")
-    log.info("\n  MONTHLY PROJECTION (Rs50,000 capital):")
-    log.info("  Average month  : Rs 1,500 – 2,000")
-    log.info("  Good month     : Rs 3,000 – 4,500")
-    log.info("  Bad month      : Rs-1,000 – 2,500")
+    log.info("\n  MONTHLY PROJECTION (Rs9,000 capital):")
+    log.info("  Average month  : Rs 270 – 360")
+    log.info("  Good month     : Rs 540 – 810")
+    log.info("  Bad month      : Rs-180 – 450")
     log.info("═"*52)
 
 
@@ -371,7 +359,7 @@ def show_status():
 
 def main():
     log.info("\n" + "═"*52)
-    log.info(f"  DELTA ALGO v12  |  {'DRY RUN' if DRY_RUN else 'LIVE'}")
+    log.info(f"  DELTA ALGO v12  (ETH)  |  {'DRY RUN' if DRY_RUN else 'LIVE'}")
     log.info(f"  {datetime.now().strftime('%d %b %Y  %H:%M IST')}")
     log.info("═"*52)
 
@@ -384,7 +372,7 @@ def main():
     log.info("\n  [1] Managing open positions...")
     open_syms = manage_positions()
 
-    log.info("\n  [2] Scanning for signals...")
+    log.info("\n  [2] Scanning for ETH signal...")
     for asset in ASSETS:
         if asset["symbol"] in open_syms:
             log.info(f"  {asset['symbol']}: already open — skip"); continue
