@@ -50,7 +50,10 @@ def _headers(method, path, body=""):
 def api_get(path):
     try:
         r = requests.get(BASE + path, headers=_headers("GET", path), timeout=15)
-        return r.json() if r.status_code == 200 else {}
+        if r.status_code != 200:
+            log.error(f"GET {path} → HTTP {r.status_code} | {r.text[:200]}")
+            return {}
+        return r.json()
     except Exception as e:
         log.error(f"GET {path}: {e}"); return {}
 
